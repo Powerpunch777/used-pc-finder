@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "is_computer_part": {"type": "boolean"},
+    "normalized_product_name": {"type": ["string", "null"]},
+    "condition_status": {
+      "type": "string",
+      "enum": ["normal", "risky", "broken", "unknown"]
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "reject": {"type": "boolean"},
+    "reason": {"type": "string", "maxLength": 240}
+  },
+  "required": [
+    "is_computer_part",
+    "normalized_product_name",
+    "condition_status",
+    "confidence",
+    "reject",
+    "reason"
+  ]
+}
