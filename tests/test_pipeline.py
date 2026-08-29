@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from used_pc_finder.ai_classifier import AIClassification
 from used_pc_finder.cli import format_deal, sample_deals
@@ -24,10 +25,12 @@ class PipelineTests(unittest.TestCase):
             Listing(
                 "3060ti", 270000, "https://example/1", "Haan", "local",
                 condition_status="normal",
+                ai_scope="standalone",
             ),
             Listing(
                 "4070s", 480000, "https://example/2", "Haan", "buy_now",
                 condition_status="normal",
+                ai_scope="standalone",
             ),
         ]
         deals = find_deals(
@@ -74,7 +77,7 @@ class PipelineTests(unittest.TestCase):
         class Classifier:
             def classify(self, _listing):
                 return AIClassification(
-                    True, "RTX 4070 SUPER", "normal", 0.98, False, "Working GPU"
+                    True, "RTX 4070 SUPER", "normal", 0.98, False, "Working GPU", "standalone"
                 )
 
         item = Listing(
@@ -113,6 +116,26 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(classified.ai_reject)
         self.assertEqual(find_deals([classified], {"RTX 4070 SUPER": 600000}, 10), [])
+
+    def test_only_active_standalone_parts_are_price_comparable(self):
+        standalone = Listing(
+            "RTX 4070 SUPER", 500000, "https://example/part", "Haan", "local",
+            description="정상 작동", condition_status="normal", ai_is_computer_part=True,
+            ai_normalized_product_name="RTX 4070 SUPER", ai_confidence=0.99,
+            ai_scope="standalone", listing_status="active",
+        )
+        prices = {"RTX 4070 SUPER": 600000}
+        self.assertEqual(len(find_deals([standalone], prices, 10, require_ai=True)), 1)
+        for blocked in (
+            replace(standalone, listing_status="sold"),
+            replace(standalone, listing_status="reserved"),
+            replace(standalone, listing_status="unavailable"),
+            replace(standalone, ai_scope="complete_pc"),
+            replace(standalone, ai_scope="bundle"),
+            replace(standalone, ai_scope="accessory"),
+            replace(standalone, ai_scope="unknown"),
+        ):
+            self.assertEqual(find_deals([blocked], prices, 10, require_ai=True), [])
 
 
 if __name__ == "__main__":

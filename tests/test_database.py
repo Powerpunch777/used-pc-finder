@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from used_pc_finder.ai_classifier import CLASSIFIER_VERSION
 from used_pc_finder.database import ListingDatabase
 from used_pc_finder.models import Listing
 
@@ -91,6 +92,25 @@ class DatabaseTests(unittest.TestCase):
             self.database.is_known(listing(listing_id="other-id"))
         )
 
+    def test_failed_ai_classification_remains_pending_for_retry(self):
+        item = Listing(
+            "RTX 4070 SUPER", 500000, "https://m.bunjang.co.kr/products/1", "", "bunjang_search",
+            "bunjang:1", "정상 작동", "unknown", False, None, 0.0, True, "CLI timeout",
+            marketplace="bunjang", product_id="1", updated_at="2026-08-28T00:00:00Z",
+        )
+        self.database.add(item)
+        self.database.record_ai_classification(
+            item,
+            "same-content",
+            model="gpt-5.6-luna",
+            reasoning_effort="low",
+            classifier_version=CLASSIFIER_VERSION,
+            classification=None,
+            execution_duration_seconds=60.0,
+            error_reason="CLI timeout",
+        )
+        self.assertEqual(self.database.candidate_state(item).status, "pending_ai")
+
     def test_initialize_safely_migrates_a_legacy_database(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.sqlite3"
@@ -130,6 +150,38 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(row["marketplace"], "karrot")
             self.assertEqual(row["product_id"], "legacy-id")
             self.assertEqual(row["condition_status"], "unknown")
+
+    def test_audit_invalidates_sold_complete_pc_and_bundle_observations_only(self):
+        values = [
+            ("part", "AMD Ryzen 5 5600X", "정상 작동 CPU", "active"),
+            ("bundle", "Ryzen 5 5600X + B450 메인보드", "세트 판매", "active"),
+            ("pc", "라이젠 5600X 본체", "완본체", "active"),
+            ("sold", "AMD Ryzen 5 5600X", "정상 작동 CPU", "sold"),
+        ]
+        for product_id, title, description, status in values:
+            item = Listing(
+                title, 150_000, f"https://m.bunjang.co.kr/products/{product_id}", "",
+                "bunjang_search", f"bunjang:{product_id}", description, "normal",
+                marketplace="bunjang", product_id=product_id, listing_status=status,
+            )
+            self.assertTrue(self.database.add(item))
+            self.database.connection.execute(
+                """INSERT INTO price_observations
+                   (marketplace, product_id, normalized_product_name, observed_price,
+                    observed_at, first_seen_at, listing_id)
+                   VALUES ('bunjang', ?, 'Ryzen 5 5600X', 150000, '2026-08-28T00:00:00Z',
+                           '2026-08-28T00:00:00Z', ?)""",
+                (product_id, f"bunjang:{product_id}"),
+            )
+        self.database.connection.commit()
+
+        result = self.database.invalidate_contaminated_price_observations()
+
+        self.assertEqual(result["invalidated"], 3)
+        self.assertEqual(
+            [item.product_id for item in self.database.price_observations("Ryzen 5 5600X")],
+            ["part"],
+        )
 
 
 if __name__ == "__main__":

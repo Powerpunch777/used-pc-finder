@@ -46,6 +46,24 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
         raise ValueError("market-price estimator must be weighted_median or weighted_mean")
     if settings.get("active_marketplace") != "bunjang":
         raise ValueError("active_marketplace must be bunjang")
+    tracking = settings.get("sale_status_tracking")
+    if not isinstance(tracking, dict):
+        raise ValueError("sale_status_tracking must be an object")
+    required_tracking = {
+        "recent_age_days", "medium_age_days", "recent_interval_hours",
+        "medium_interval_hours", "older_interval_hours",
+    }
+    if missing_tracking := required_tracking.difference(tracking):
+        raise ValueError(
+            "Missing sale_status_tracking settings: "
+            f"{', '.join(sorted(missing_tracking))}"
+        )
+    if (
+        float(tracking["recent_age_days"]) < 0
+        or float(tracking["medium_age_days"]) < float(tracking["recent_age_days"])
+        or any(float(tracking[key]) <= 0 for key in required_tracking if key.endswith("_hours"))
+    ):
+        raise ValueError("sale_status_tracking ages and intervals must be ordered and positive")
     sources = settings.get("bunjang_sources", [])
     if not isinstance(sources, list) or not sources:
         raise ValueError("bunjang_sources must be a non-empty list")
@@ -71,7 +89,7 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
             "reasoning_effort",
             "timeout_seconds",
             "confidence_threshold",
-            "max_ai_calls_per_scan",
+            "ai_concurrency",
             "schema_path",
         }
         missing_ai_settings = required_ai_settings.difference(ai_settings)
@@ -84,8 +102,8 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
             raise ValueError("AI classification timeout_seconds must be positive")
         if not 0 <= float(ai_settings["confidence_threshold"]) <= 1:
             raise ValueError("AI classification confidence_threshold must be from 0 to 1")
-        if int(ai_settings["max_ai_calls_per_scan"]) < 1:
-            raise ValueError("AI classification max_ai_calls_per_scan must be positive")
+        if int(ai_settings["ai_concurrency"]) < 1:
+            raise ValueError("AI classification ai_concurrency must be positive")
     email_settings = settings.get("email_notifications", {"enabled": False})
     if not isinstance(email_settings, dict):
         raise ValueError("email_notifications must be an object")

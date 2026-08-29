@@ -15,7 +15,8 @@ from .models import Listing
 
 LOGGER = logging.getLogger(__name__)
 _STATUSES = frozenset({"normal", "risky", "broken", "unknown"})
-CLASSIFIER_VERSION = "codex-cli-listing-v1"
+_SCOPES = frozenset({"standalone", "bundle", "complete_pc", "accessory", "unknown"})
+CLASSIFIER_VERSION = "codex-cli-listing-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class AIClassification:
     confidence: float
     reject: bool
     reason: str
+    scope: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,13 @@ listings. Use condition_status normal, risky, broken, or unknown. Set reject tru
 unless the listing is a complete, working computer part with a clear identity.
 For normalized_product_name, return a concise canonical product model suitable for
 price matching (for example, \"RTX 4070 SUPER\"), or null if uncertain.
+
+Classify scope from title and description: standalone only for one sellable computer
+part by itself; bundle for CPU+motherboard/RAM or other multi-part or ambiguous
+offers; complete_pc for a complete desktop/system; accessory for box-only, cable,
+cooler, adapter, or accessory-only offers; and unknown when scope is unclear. A
+standalone part may include its original box or stock cooler, but a box-only offer
+is an accessory.
 
 Listing title: {listing.title}
 Listing description: {listing.description}
@@ -160,6 +169,7 @@ def _parse_result(raw: Any) -> AIClassification:
         "confidence",
         "reject",
         "reason",
+        "scope",
     }:
         raise ValueError("classification does not match the required keys")
     normalized = raw["normalized_product_name"]
@@ -173,6 +183,7 @@ def _parse_result(raw: Any) -> AIClassification:
         or not 0 <= confidence <= 1
         or not isinstance(raw["reject"], bool)
         or not isinstance(raw["reason"], str)
+        or raw["scope"] not in _SCOPES
     ):
         raise ValueError("classification has invalid field values")
     return AIClassification(
@@ -182,4 +193,5 @@ def _parse_result(raw: Any) -> AIClassification:
         float(confidence),
         raw["reject"],
         raw["reason"].strip(),
+        raw["scope"],
     )

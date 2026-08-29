@@ -76,6 +76,18 @@ def _weighted_median(values: list[tuple[int, float]]) -> int:
     return ordered[-1][0]
 
 
+def estimation_observations(
+    observations: Iterable[PriceObservation], *, now: datetime, window_days: int
+) -> list[PriceObservation]:
+    """Return recent, non-outlying observations used by either estimator."""
+    return [
+        observation
+        for observation, _age in _recent_and_non_outlying(
+            observations, now=now, window_days=window_days
+        )
+    ]
+
+
 def estimate_market_price(
     normalized_product_name: str,
     observations: Iterable[PriceObservation],

@@ -1,8 +1,10 @@
+import threading
+import time
 import unittest
 from dataclasses import replace
 
 from used_pc_finder.ai_classifier import AIClassification, ClassificationAttempt
-from used_pc_finder.cli import AiListingProcessor, AiScanStats
+from used_pc_finder.cli import AiListingProcessor, AiScanStats, QueuedAiClassification, run_ai_worker_pool
 from used_pc_finder.database import ListingDatabase
 from used_pc_finder.models import Listing
 
@@ -33,14 +35,14 @@ class FakeClassifier:
 
 def normal_attempt(confidence: float = 0.95, name: str = "ASUS RTX 3070"):
     return ClassificationAttempt(
-        AIClassification(True, name, "normal", confidence, False, "working complete GPU"),
+        AIClassification(True, name, "normal", confidence, False, "working complete GPU", "standalone"),
         0.25,
         None,
     )
 
 
 class AiPipelineTests(unittest.TestCase):
-    settings = {"confidence_threshold": 0.85, "max_ai_calls_per_scan": 10}
+    settings = {"confidence_threshold": 0.85, "ai_concurrency": 5}
 
     def setUp(self):
         self.database = ListingDatabase(":memory:")
@@ -61,11 +63,22 @@ class AiPipelineTests(unittest.TestCase):
         self.assertEqual(result.condition_status, "normal")
         self.assertEqual(result.ai_normalized_product_name, "RTX 3070")
         self.assertEqual(stats.accepted_normal, 1)
+        self.assertEqual(stats.classified_listings, [result])
 
     def test_low_confidence_result_becomes_unknown(self):
         result = self.processor(FakeClassifier(normal_attempt(0.84)))(listing())
         self.assertTrue(result.ai_reject)
         self.assertEqual(result.condition_status, "unknown")
+
+    def test_ai_bundle_scope_is_rejected_even_with_a_clear_product_name(self):
+        attempt = ClassificationAttempt(
+            AIClassification(True, "ASUS RTX 3070", "normal", 0.99, False, "GPU and board set", "bundle"),
+            0.1,
+            None,
+        )
+        result = self.processor(FakeClassifier(attempt))(listing())
+        self.assertTrue(result.ai_reject)
+        self.assertEqual(result.ai_scope, "bundle")
 
     def test_broken_and_non_part_listings_are_rejected_without_ai(self):
         classifier = FakeClassifier(normal_attempt())
@@ -81,16 +94,76 @@ class AiPipelineTests(unittest.TestCase):
         self.assertEqual(result.condition_status, "unknown")
         self.assertIsNone(result.ai_normalized_product_name)
 
-    def test_max_call_count_leaves_remaining_listing_unclassified(self):
-        stats = AiScanStats()
-        classifier = FakeClassifier(normal_attempt())
-        processor = self.processor(classifier, stats, {**self.settings, "max_ai_calls_per_scan": 1})
-        first = processor(listing("1"))
-        second = processor(listing("2"))
-        self.assertFalse(first.ai_reject)
-        self.assertIsNone(second.ai_is_computer_part)
-        self.assertEqual(stats.calls, 1)
-        self.assertEqual(stats.deferred, 1)
+    def queued_work(self, classifier, count):
+        processor = self.processor(classifier)
+        queued = [processor.prepare(listing(str(number))) for number in range(count)]
+        self.assertTrue(all(isinstance(item, QueuedAiClassification) for item in queued))
+        return queued
+
+    def test_worker_pool_never_exceeds_configured_concurrency(self):
+        class ConcurrentClassifier(FakeClassifier):
+            def __init__(self):
+                super().__init__(normal_attempt())
+                self.active = self.maximum_active = 0
+                self.lock = threading.Lock()
+
+            def classify_attempt(self, item):
+                with self.lock:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                time.sleep(0.02)
+                with self.lock:
+                    self.active -= 1
+                return normal_attempt()
+
+        classifier = ConcurrentClassifier()
+        telemetry = run_ai_worker_pool(self.queued_work(classifier, 12), 5)
+        self.assertEqual(telemetry.completed_calls, 12)
+        self.assertEqual(telemetry.max_concurrency_observed, 5)
+        self.assertLessEqual(classifier.maximum_active, 5)
+
+    def test_completed_task_refills_slot_without_waiting_for_other_workers(self):
+        class OrderedClassifier(FakeClassifier):
+            def __init__(self):
+                super().__init__(normal_attempt())
+                self.events = []
+                self.lock = threading.Lock()
+
+            def classify_attempt(self, item):
+                with self.lock:
+                    self.events.append(("start", item.product_id, time.monotonic()))
+                time.sleep({"0": 0.08, "1": 0.01, "2": 0.01}[item.product_id])
+                with self.lock:
+                    self.events.append(("finish", item.product_id, time.monotonic()))
+                return normal_attempt()
+
+        classifier = OrderedClassifier()
+        run_ai_worker_pool(self.queued_work(classifier, 3), 2)
+        events = {(kind, product_id): moment for kind, product_id, moment in classifier.events}
+        self.assertLess(events[("start", "2")], events[("finish", "0")])
+
+    def test_failed_task_does_not_block_the_queue(self):
+        class FailureClassifier(FakeClassifier):
+            def __init__(self):
+                super().__init__(normal_attempt())
+                self.events = []
+                self.lock = threading.Lock()
+
+            def classify_attempt(self, item):
+                with self.lock:
+                    self.events.append(("start", item.product_id, time.monotonic()))
+                time.sleep(0.06 if item.product_id == "0" else 0.01)
+                with self.lock:
+                    self.events.append(("finish", item.product_id, time.monotonic()))
+                if item.product_id == "1":
+                    return ClassificationAttempt(None, 0.01, "simulated failure")
+                return normal_attempt()
+
+        classifier = FailureClassifier()
+        telemetry = run_ai_worker_pool(self.queued_work(classifier, 3), 2)
+        events = {(kind, product_id): moment for kind, product_id, moment in classifier.events}
+        self.assertEqual((telemetry.completed_calls, telemetry.failures), (3, 1))
+        self.assertLess(events[("start", "2")], events[("finish", "0")])
 
     def test_cached_result_is_reused_but_content_change_reclassifies(self):
         stats = AiScanStats()
@@ -112,6 +185,7 @@ class AiPipelineTests(unittest.TestCase):
             self.assertTrue(result.ai_reject)
             self.assertEqual(result.condition_status, "unknown")
             self.assertEqual(stats.failures, 1)
+            self.assertEqual(stats.classified_listings, [result])
 
 
 if __name__ == "__main__":

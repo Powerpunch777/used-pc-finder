@@ -23,6 +23,12 @@ class Listing:
     source_key: str = ""
     updated_at: str | None = None
     search_fingerprint: str = ""
+    canonical_url: str | None = None
+    listing_status: str = "active"
+    ai_scope: str = "unknown"
+    last_active_at: str | None = None
+    first_sold_seen_at: str | None = None
+    last_active_price: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

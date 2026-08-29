@@ -47,6 +47,7 @@ class MarketEstimatorTests(unittest.TestCase):
                 "RTX 3070", 500_000, "https://example/1", "", "bunjang_search",
                 "bunjang:1", "정상 작동", "normal", marketplace="bunjang",
                 product_id="1", updated_at="2026-06-01T00:00:00Z",
+                ai_scope="standalone",
             )
             self.assertTrue(database.add(old))
             database.record_price_observation(
@@ -56,6 +57,7 @@ class MarketEstimatorTests(unittest.TestCase):
                 "RTX 3070", 350_000, "https://example/1", "", "bunjang_search",
                 "bunjang:1", "정상 작동", "normal", marketplace="bunjang",
                 product_id="1", updated_at="2026-08-28T00:00:00Z",
+                ai_scope="standalone",
             )
             state = database.candidate_state(reduced)
             database.store_processed(reduced, state)

@@ -22,6 +22,7 @@ class ConditionTests(unittest.TestCase):
             "local",
             description=description,
             condition_status=status,
+            ai_scope="standalone",
         )
 
         self.assertEqual(status, "broken")
@@ -38,6 +39,7 @@ class ConditionTests(unittest.TestCase):
             "local",
             description=description,
             condition_status=status,
+            ai_scope="standalone",
         )
 
         deals = find_deals([listing], self.market_prices, 10)

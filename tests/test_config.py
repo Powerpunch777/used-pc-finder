@@ -27,6 +27,7 @@ class ConfigTests(unittest.TestCase):
         settings = load_settings()
         self.assertEqual(settings["active_marketplace"], "bunjang")
         self.assertEqual(settings["maximum_listing_price"], 500000)
+        self.assertEqual(settings["ai_classification"]["ai_concurrency"], 4)
         self.assertEqual(settings["market_price_estimation"]["estimator"], "weighted_median")
         self.assertEqual(len(settings["bunjang_sources"]), 37)
         self.assertIn("RTX 3080", [source["query"] for source in settings["bunjang_sources"]])

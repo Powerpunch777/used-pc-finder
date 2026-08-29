@@ -63,19 +63,26 @@ editable rules in `config/condition_rules.json` classify a listing as `normal`,
 `risky`, `broken`, or `unknown`. Only `normal` listings can reach price comparison
 or notification. All other conditions are still stored in SQLite.
 
+Bunjang requests retry transient connection/read timeouts and 5xx responses up to
+two times with exponential backoff. Permanent 4xx responses are not retried. An
+exhausted detail request is durably queued by product ID and retried on a later
+full-backfill invocation; it does not pause the page or query. Failed searches are
+logged and leave their cursor checkpoint unchanged for a later run.
+
 The Codex CLI classifier is enabled by default and uses the already authenticated
 ChatGPT Codex session—not `OPENAI_API_KEY`. It receives only crawler-collected
 listing data after the budget, de-duplication, ad, and deterministic-condition
 gates. It runs `gpt-5.6-luna` at `low` reasoning with a strict JSON schema, a
-60-second timeout, 0.85 confidence threshold, and at most 10 calls per scan;
-all values are editable in `ai_classification`. Codex web search is not enabled
+90-second timeout, 0.85 confidence threshold, and a streaming worker pool of
+two concurrent calls by default; all values are editable in `ai_classification`.
+Codex web search is not enabled
 and the prompt prohibits tools, browsing, and marketplace access.
 
 Only high-confidence, normal, non-rejected computer parts whose AI product name
 can be converted through the local canonical alias system can reach pricing. A
 timeout, subprocess error, unsupported model, malformed output, or schema error
-fails closed and cannot notify. Reaching the call cap leaves candidates pending for
-a later scan. SQLite's `ai_classifications` table retains every actual result and
+fails closed and cannot notify; failures remain eligible for retry on a later scan.
+SQLite's `ai_classifications` table retains every actual result and
 failure with model, reasoning effort, content fingerprint, timestamp, duration,
 and classifier version; an unchanged fingerprint reuses a successful result.
 
@@ -108,8 +115,11 @@ oldest/newest valid observations, and whether it is automatic or manual fallback
 ## Email notifications
 
 Set `email_notifications.enabled` to `true` and configure the sender, recipient,
-and SMTP details in `config/settings.json`. The password is never stored in the
-repository: export the configured environment variable (currently
-`KARROT_SMTP_PASSWORD`) before an email-enabled scan. Successful notifications are
-recorded in SQLite. When a stored Bunjang product changes, its notification state
-is reset so a newly reduced price can be considered again.
+and SMTP details in `config/settings.json`. For unattended local use, run
+`.venv/bin/python main.py --setup-email` once. It uses hidden input and saves the
+Gmail app password only in `~/.config/used_pc_finder/secrets.env` with mode `600`;
+normal program startup loads it automatically. To send exactly one real
+bargain-format SMTP test email, run `.venv/bin/python main.py --test-email`.
+Successful notifications are recorded in SQLite. When a stored Bunjang product
+changes, its notification state is reset so a newly reduced price can be
+considered again.

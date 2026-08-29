@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .bunjang import BunjangCrawler
+from .bunjang import BunjangCrawler, BunjangRequestError
 from .database import CandidateState, ListingDatabase
 from .models import Listing
 from .pricing import comparable_product_name
@@ -20,6 +20,7 @@ class BunjangScanResult:
     search_records_fetched: int
     new_count: int
     updated_count: int
+    pending_ai_count: int
     unchanged_count: int
     duplicate_count: int
     detail_requests: int
@@ -27,7 +28,9 @@ class BunjangScanResult:
     ordering_monotonic: bool
     stopped_at_watermark: bool
     over_budget_count: int
+    irrelevant_count: int
     price_observations_recorded: int
+    processed_states: dict[str, CandidateState]
 
 
 def scan_bunjang_source(
@@ -48,9 +51,12 @@ def scan_bunjang_source(
     cursor: str | None = None
     previous_page_last: str | None = None
     listings: list[Listing] = []
-    records_fetched = new_count = updated_count = unchanged_count = duplicate_count = over_budget_count = 0
+    records_fetched = new_count = updated_count = pending_ai_count = unchanged_count = 0
+    duplicate_count = over_budget_count = irrelevant_count = 0
     price_observations_recorded = 0
-    pages_fetched = detail_before = crawler.detail_requests
+    processed_states: dict[str, CandidateState] = {}
+    pages_fetched = 0
+    detail_before = crawler.detail_requests
     ordering_monotonic = True
     stopped_at_watermark = False
     boundary_pages = 0
@@ -58,10 +64,15 @@ def scan_bunjang_source(
     examined = 0
 
     for _page_number in range(max_pages):
-        page = crawler.search_page(query, source_key, cursor)
+        try:
+            page = crawler.search_page(query, source_key, cursor)
+        except (BunjangRequestError, KeyError, TypeError, ValueError):
+            LOGGER.exception("Unable to fetch Bunjang search for source %s", source_key)
+            break
         pages_fetched += 1
         records_fetched += page.search_record_count or len(page.listings)
         over_budget_count += page.over_budget_count
+        irrelevant_count += page.irrelevant_count
         page_times = [value.updated_at for value in page.listings if value.updated_at]
         if not page.is_monotonic_descending or (
             previous_page_last and page_times and previous_page_last < page_times[0]
@@ -112,10 +123,14 @@ def scan_bunjang_source(
                     page_all_old_unchanged = False
                     continue
                 listings.append(processed)
+                if processed.product_id:
+                    processed_states[processed.product_id] = state
                 if state.status == "new":
                     new_count += 1
-                else:
+                elif state.status == "updated":
                     updated_count += 1
+                else:
+                    pending_ai_count += 1
                 if processed.updated_at and (
                     newest_successful is None or processed.updated_at > newest_successful
                 ):
@@ -148,6 +163,7 @@ def scan_bunjang_source(
         records_fetched,
         new_count,
         updated_count,
+        pending_ai_count,
         unchanged_count,
         duplicate_count,
         crawler.detail_requests - detail_before,
@@ -155,5 +171,7 @@ def scan_bunjang_source(
         ordering_monotonic,
         stopped_at_watermark,
         over_budget_count,
+        irrelevant_count,
         price_observations_recorded,
+        processed_states,
     )

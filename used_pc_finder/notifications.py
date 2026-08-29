@@ -1,4 +1,4 @@
-"""Email notifications for newly detected deals."""
+"""One-email-per-scan Bunjang bargain digest notifications."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import os
 import smtplib
 import ssl
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from email.message import EmailMessage
 from typing import Any, Protocol
 
@@ -16,46 +16,89 @@ from .models import Deal
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_PASSWORD_ENVIRONMENT_VARIABLE = "KARROT_SMTP_PASSWORD"
+BJUNJANG_PRODUCT_URL = "https://m.bunjang.co.kr/products/{product_id}"
 
 
-class DealNotifier(Protocol):
-    def send_deal(self, deal: Deal) -> None: ...
+class DigestNotifier(Protocol):
+    def send_digest(self, deals: Sequence[Deal], pricing_sources: Mapping[str, str]) -> None: ...
 
 
-def _deal_fields(deal: Deal) -> tuple[tuple[str, str], ...]:
+def bunjang_listing_url(deal: Deal) -> str:
+    """Return the Bunjang canonical link and never fall back to a legacy URL."""
     listing = deal.listing
-    return (
-        ("Product", deal.normalized_name),
-        ("Listing price", f"{listing.price:,} KRW"),
-        ("Reference market price", f"{deal.reference_price:,} KRW"),
-        ("Discount", f"{deal.discount_percent:.1f}%"),
-        ("Location", listing.location or "Not specified"),
-        ("Source type", listing.source_type),
-    )
+    if listing.marketplace != "bunjang":
+        raise ValueError("Bunjang notifications require a Bunjang listing")
+    if listing.canonical_url:
+        return listing.canonical_url
+    if not listing.product_id:
+        raise ValueError("Bunjang notifications require a product_id")
+    return BJUNJANG_PRODUCT_URL.format(product_id=listing.product_id)
 
 
-def build_deal_email(deal: Deal, sender: str, recipient: str) -> EmailMessage:
-    """Build a multipart message with text and HTML alternatives for one deal."""
-    listing = deal.listing
-    fields = _deal_fields(deal)
-    text_lines = ["Karrot computer-parts deal found", ""]
-    text_lines.extend(f"{label}: {value}" for label, value in fields)
-    text_lines.extend(("", f"Original Karrot listing: {listing.url}"))
-    html_rows = "".join(
-        "<tr><th align=\"left\" style=\"padding:4px 12px 4px 0\">"
-        f"{html.escape(label)}</th><td>{html.escape(value)}</td></tr>"
-        for label, value in fields
-    )
-    listing_url = html.escape(listing.url, quote=True)
+def _confidence_text(deal: Deal) -> str:
+    confidence = deal.listing.ai_confidence
+    return f"{confidence * 100:.1f}%" if confidence is not None else "Not available"
+
+
+def _sorted_deals(deals: Sequence[Deal]) -> list[Deal]:
+    return sorted(deals, key=lambda deal: deal.discount_percent, reverse=True)
+
+
+def build_deal_digest_email(
+    deals: Sequence[Deal],
+    pricing_sources: Mapping[str, str],
+    sender: str,
+    recipient: str,
+) -> EmailMessage:
+    """Build one multipart Bunjang digest, ordered by highest discount first."""
+    ordered_deals = _sorted_deals(deals)
+    if not ordered_deals:
+        raise ValueError("A Bunjang digest requires at least one deal")
+
+    text_lines = ["Bunjang computer-parts deal digest", ""]
+    html_rows: list[str] = []
+    for index, deal in enumerate(ordered_deals, start=1):
+        listing = deal.listing
+        listing_url = bunjang_listing_url(deal)
+        pricing_source = pricing_sources.get(deal.normalized_name, "manual")
+        fields = (
+            ("Product", deal.normalized_name),
+            ("Listing price", f"{listing.price:,} KRW"),
+            ("Reference market price", f"{deal.reference_price:,} KRW"),
+            ("Discount", f"{deal.discount_percent:.1f}%"),
+            ("Condition", listing.condition_status),
+            ("AI confidence", _confidence_text(deal)),
+            ("Pricing source", pricing_source),
+        )
+        text_lines.append(f"{index}. {deal.normalized_name}")
+        text_lines.extend(f"   {label}: {value}" for label, value in fields[1:])
+        text_lines.extend((f"   Bunjang listing: {listing_url}", ""))
+        html_rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td>{html.escape(deal.normalized_name)}</td>"
+            f"<td>{listing.price:,} KRW</td>"
+            f"<td>{deal.reference_price:,} KRW</td>"
+            f"<td>{deal.discount_percent:.1f}%</td>"
+            f"<td>{html.escape(listing.condition_status)}</td>"
+            f"<td>{html.escape(_confidence_text(deal))}</td>"
+            f"<td>{html.escape(pricing_source)}</td>"
+            f"<td><a href=\"{html.escape(listing_url, quote=True)}\">Open listing</a></td>"
+            "</tr>"
+        )
+
     html_body = (
-        "<html><body><h2>Karrot computer-parts deal found</h2>"
-        f"<table>{html_rows}</table>"
-        f"<p><a href=\"{listing_url}\">Open original Karrot listing</a></p>"
-        "</body></html>"
+        "<html><body><h2>Bunjang computer-parts deal digest</h2>"
+        "<table><thead><tr>"
+        "<th>#</th><th>Product</th><th>Listing price</th>"
+        "<th>Reference market price</th><th>Discount</th><th>Condition</th>"
+        "<th>AI confidence</th><th>Pricing source</th><th>Bunjang listing</th>"
+        "</tr></thead><tbody>"
+        f"{''.join(html_rows)}"
+        "</tbody></table></body></html>"
     )
-
     message = EmailMessage()
-    message["Subject"] = f"Karrot deal: {deal.normalized_name} ({deal.discount_percent:.1f}% off)"
+    message["Subject"] = f"Bunjang deal digest: {len(ordered_deals)} bargain(s)"
     message["From"] = sender
     message["To"] = recipient
     message.set_content("\n".join(text_lines))
@@ -92,22 +135,21 @@ class EmailNotifier:
             smtp_port=int(settings["smtp_port"]),
             sender_address=str(settings["sender_address"]),
             password_environment_variable=str(
-                settings.get(
-                    "password_environment_variable",
-                    DEFAULT_PASSWORD_ENVIRONMENT_VARIABLE,
-                )
+                settings.get("password_environment_variable", DEFAULT_PASSWORD_ENVIRONMENT_VARIABLE)
             ),
             use_starttls=bool(settings.get("use_starttls", True)),
         )
 
-    def send_deal(self, deal: Deal) -> None:
+    def send_digest(self, deals: Sequence[Deal], pricing_sources: Mapping[str, str]) -> None:
         password = os.environ.get(self.password_environment_variable)
         if not password:
             raise ValueError(
                 "SMTP password is not set in environment variable "
                 f"{self.password_environment_variable}"
             )
-        message = build_deal_email(deal, self.sender_address, self.recipient_address)
+        message = build_deal_digest_email(
+            deals, pricing_sources, self.sender_address, self.recipient_address
+        )
         with self.smtp_factory(self.smtp_host, self.smtp_port, timeout=20) as client:
             client.ehlo()
             if self.use_starttls:
@@ -117,24 +159,31 @@ class EmailNotifier:
             client.send_message(message)
 
 
-def send_unnotified_deals(
-    deals: list[Deal],
+def send_unnotified_deal_digest(
+    deals: Sequence[Deal],
     database: ListingDatabase,
-    email_settings: dict[str, Any],
-    notifier: DealNotifier | None = None,
+    email_settings: Mapping[str, Any],
+    pricing_sources: Mapping[str, str],
+    notifier: DigestNotifier | None = None,
 ) -> int:
-    """Send deals once, recording success only after SMTP accepts the message."""
+    """Send one digest after a scan and record all included listings on SMTP success."""
     if not email_settings.get("enabled", False):
         return 0
-    sender = notifier or EmailNotifier.from_settings(email_settings)
-    sent = 0
-    for deal in deals:
-        if database.was_notified(deal.listing):
-            continue
-        try:
-            sender.send_deal(deal)
-            database.mark_notified(deal.listing)
-            sent += 1
-        except Exception:
-            LOGGER.exception("Unable to send email notification for %s", deal.listing.url)
-    return sent
+    pending = [
+        deal
+        for deal in deals
+        if deal.listing.listing_status == "active"
+        and deal.listing.ai_scope == "standalone"
+        and not database.was_notified(deal.listing)
+    ]
+    if not pending:
+        return 0
+    sender = notifier or EmailNotifier.from_settings(dict(email_settings))
+    try:
+        sender.send_digest(pending, pricing_sources)
+    except Exception:
+        LOGGER.exception("Unable to send Bunjang deal digest")
+        return 0
+    for deal in pending:
+        database.mark_notified(deal.listing)
+    return len(pending)

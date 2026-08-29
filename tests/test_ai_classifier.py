@@ -28,6 +28,7 @@ def valid_result() -> dict[str, object]:
         "confidence": 0.98,
         "reject": False,
         "reason": "Complete, working graphics card.",
+        "scope": "standalone",
     }
 
 
