@@ -1,4 +1,5 @@
 import unittest
+import time
 from dataclasses import replace
 
 from used_pc_finder.ai_classifier import AIClassification, ClassificationAttempt
@@ -169,3 +170,45 @@ class FullBackfillTests(unittest.TestCase):
             [(row["error_category"], row["queued_count"], row["terminal_count"] ) for row in stats],
             [("404_or_unavailable", 0, 1)],
         )
+
+    def test_detail_http_failures_never_enter_ai_review(self):
+        class MustNotClassify:
+            model = "test"
+            reasoning_effort = "low"
+
+            def classify_attempt(self, _value):
+                raise AssertionError("unreliable HTTP detail content must not reach AI")
+
+        run_full_market_price_backfill(
+            self.database, TerminalDetailFailureCrawler(), self.sources, self.settings,
+            MustNotClassify(), progress=lambda _line: None,
+        )
+
+    def test_crawling_reaches_later_pages_while_ai_review_is_running(self):
+        class SlowClassifier(FakeClassifier):
+            def __init__(self):
+                self.finished = False
+
+            def classify_attempt(self, value):
+                time.sleep(0.05)
+                self.finished = True
+                return super().classify_attempt(value)
+
+        classifier = SlowClassifier()
+
+        class PipelinedCrawler(FakeCrawler):
+            def __init__(self):
+                self.second_page_saw_ai_finished = None
+
+            def search_page(self, _query, _source_key, cursor=None):
+                if cursor is None:
+                    first = replace(item("valid"), title="그래픽카드 판매")
+                    return BunjangPage([first], "second", True)
+                self.second_page_saw_ai_finished = classifier.finished
+                return BunjangPage([], None, True)
+
+        crawler = PipelinedCrawler()
+        run_full_market_price_backfill(
+            self.database, crawler, self.sources, self.settings, classifier, progress=lambda _line: None
+        )
+        self.assertFalse(crawler.second_page_saw_ai_finished)

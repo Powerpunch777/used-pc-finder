@@ -329,6 +329,7 @@ class BunjangScanTests(unittest.TestCase):
 
     def test_duplicate_product_across_queries_is_not_processed_twice(self):
         item = candidate("1", "2026-08-28T10:00:00+09:00")
+        item = replace(item, title="그래픽카드 판매")
         first = FakeCrawler({"first": BunjangPage([item], None, True)})
         seen = set()
         self.scan(first, seen)
@@ -361,7 +362,9 @@ class BunjangScanTests(unittest.TestCase):
             {"confidence_threshold": 0.85, "ai_concurrency": 5},
             AiScanStats(),
         )
-        item = candidate("1", "2026-08-28T10:00:00+09:00")
+        item = replace(
+            candidate("1", "2026-08-28T10:00:00+09:00"), title="그래픽카드 판매"
+        )
         seen = set()
         self.scan(FakeCrawler({"first": BunjangPage([item], None, True)}), seen, processor)
         self.scan(FakeCrawler({"first": BunjangPage([item], None, True)}), seen, processor)

@@ -112,6 +112,9 @@ class ListingDatabase:
                     CHECK (listing_status IN ('active', 'reserved', 'sold', 'unavailable')),
                 ai_scope TEXT NOT NULL DEFAULT 'unknown'
                     CHECK (ai_scope IN ('standalone', 'bundle', 'complete_pc', 'accessory', 'unknown')),
+                ai_sale_status TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (ai_sale_status IN ('active', 'reserved', 'sold', 'unavailable', 'unknown')),
+                ai_usable_for_market_price INTEGER NOT NULL DEFAULT 0,
                 last_active_at TEXT,
                 first_sold_seen_at TEXT,
                 last_active_price INTEGER CHECK (last_active_price IS NULL OR last_active_price >= 0),
@@ -176,6 +179,14 @@ class ListingDatabase:
         if "ai_scope" not in columns:
             self.connection.execute(
                 "ALTER TABLE listings ADD COLUMN ai_scope TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "ai_sale_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listings ADD COLUMN ai_sale_status TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "ai_usable_for_market_price" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listings ADD COLUMN ai_usable_for_market_price INTEGER NOT NULL DEFAULT 0"
             )
         if "last_active_at" not in columns:
             self.connection.execute("ALTER TABLE listings ADD COLUMN last_active_at TEXT")
@@ -402,6 +413,9 @@ class ListingDatabase:
                     CHECK (condition_status IN ('normal', 'risky', 'broken', 'unknown')),
                 scope TEXT NOT NULL DEFAULT 'unknown'
                     CHECK (scope IN ('standalone', 'bundle', 'complete_pc', 'accessory', 'unknown')),
+                sale_status TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (sale_status IN ('active', 'reserved', 'sold', 'unavailable', 'unknown')),
+                usable_for_market_price INTEGER NOT NULL DEFAULT 0,
                 confidence REAL,
                 reject INTEGER NOT NULL,
                 reason TEXT NOT NULL,
@@ -427,6 +441,14 @@ class ListingDatabase:
             self.connection.execute(
                 "ALTER TABLE ai_classifications ADD COLUMN scope TEXT NOT NULL DEFAULT 'unknown'"
             )
+        if "sale_status" not in ai_columns:
+            self.connection.execute(
+                "ALTER TABLE ai_classifications ADD COLUMN sale_status TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "usable_for_market_price" not in ai_columns:
+            self.connection.execute(
+                "ALTER TABLE ai_classifications ADD COLUMN usable_for_market_price INTEGER NOT NULL DEFAULT 0"
+            )
         self.connection.commit()
 
     def add(self, listing: Listing) -> bool:
@@ -443,8 +465,9 @@ class ListingDatabase:
                 (listing_id, url, title, price, location, source_type, description, condition_status,
                  ai_is_computer_part, ai_normalized_product_name, ai_confidence, ai_reject, ai_reason,
                  marketplace, product_id, source_key, updated_at, search_fingerprint, canonical_url,
-                 listing_status, ai_scope, last_active_at, first_sold_seen_at, last_active_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 listing_status, ai_scope, ai_sale_status, ai_usable_for_market_price,
+                 last_active_at, first_sold_seen_at, last_active_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 listing.listing_id,
@@ -468,6 +491,8 @@ class ListingDatabase:
                 listing.canonical_url,
                 listing.listing_status,
                 listing.ai_scope,
+                listing.ai_sale_status,
+                int(listing.ai_usable_for_market_price),
                 last_active_at,
                 listing.first_sold_seen_at,
                 last_active_price,
@@ -729,7 +754,7 @@ class ListingDatabase:
                 description = ?, condition_status = ?, ai_is_computer_part = ?,
                 ai_normalized_product_name = ?, ai_confidence = ?, ai_reject = ?, ai_reason = ?,
                 source_key = ?, updated_at = ?, search_fingerprint = ?, canonical_url = ?,
-                listing_status = ?, ai_scope = ?,
+                listing_status = ?, ai_scope = ?, ai_sale_status = ?, ai_usable_for_market_price = ?,
                 last_active_at = CASE WHEN ? = 'active' THEN COALESCE(?, CURRENT_TIMESTAMP) ELSE last_active_at END,
                 last_active_price = CASE WHEN ? = 'active' THEN ? ELSE last_active_price END,
                 first_sold_seen_at = CASE WHEN ? = 'sold' THEN COALESCE(first_sold_seen_at, CURRENT_TIMESTAMP) ELSE first_sold_seen_at END,
@@ -744,6 +769,7 @@ class ListingDatabase:
                 listing.ai_reject, listing.ai_reason, listing.source_key,
                 listing.updated_at, listing.search_fingerprint, listing.canonical_url,
                 listing.listing_status, listing.ai_scope,
+                listing.ai_sale_status, int(listing.ai_usable_for_market_price),
                 listing.listing_status, listing.last_active_at,
                 listing.listing_status,
                 listing.last_active_price if listing.last_active_price is not None else listing.price,
@@ -783,7 +809,7 @@ class ListingDatabase:
                 description = ?, condition_status = ?, ai_is_computer_part = ?,
                 ai_normalized_product_name = ?, ai_confidence = ?, ai_reject = ?, ai_reason = ?,
                 source_key = ?, updated_at = ?, search_fingerprint = ?, canonical_url = ?,
-                listing_status = ?, ai_scope = ?
+                listing_status = ?, ai_scope = ?, ai_sale_status = ?, ai_usable_for_market_price = ?
             WHERE id = ?
             """,
             (
@@ -793,7 +819,8 @@ class ListingDatabase:
                 listing.ai_normalized_product_name, listing.ai_confidence,
                 listing.ai_reject, listing.ai_reason, listing.source_key,
                 listing.updated_at, listing.search_fingerprint, listing.canonical_url,
-                listing.listing_status, listing.ai_scope, int(row["id"]),
+                listing.listing_status, listing.ai_scope, listing.ai_sale_status,
+                int(listing.ai_usable_for_market_price), int(row["id"]),
             ),
         )
         self.connection.commit()
@@ -820,7 +847,8 @@ class ListingDatabase:
                    condition_status, ai_is_computer_part, ai_normalized_product_name,
                    ai_confidence, ai_reject, ai_reason, marketplace, product_id,
                    source_key, updated_at, search_fingerprint, canonical_url,
-                   listing_status, ai_scope, last_active_at, first_sold_seen_at,
+                   listing_status, ai_scope, ai_sale_status, ai_usable_for_market_price,
+                   last_active_at, first_sold_seen_at,
                    last_active_price, first_seen_at
             FROM listings
             WHERE marketplace = 'bunjang'
@@ -871,6 +899,8 @@ class ListingDatabase:
                         search_fingerprint=str(row["search_fingerprint"]),
                         canonical_url=str(row["canonical_url"]) if row["canonical_url"] else None,
                         listing_status=str(row["listing_status"]), ai_scope=str(row["ai_scope"]),
+                        ai_sale_status=str(row["ai_sale_status"]),
+                        ai_usable_for_market_price=bool(row["ai_usable_for_market_price"]),
                         last_active_at=str(row["last_active_at"]) if row["last_active_at"] else None,
                         first_sold_seen_at=str(row["first_sold_seen_at"]) if row["first_sold_seen_at"] else None,
                         last_active_price=int(row["last_active_price"]) if row["last_active_price"] is not None else None,
@@ -990,9 +1020,10 @@ class ListingDatabase:
             INSERT INTO ai_classifications
                 (marketplace, product_id, listing_id, classification_fingerprint,
                  model, reasoning_effort, classifier_version, is_computer_part,
-                 normalized_product_name, condition_status, scope, confidence, reject, reason,
+                 normalized_product_name, condition_status, scope, sale_status,
+                 usable_for_market_price, confidence, reject, reason,
                  execution_duration_seconds, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 listing.marketplace, listing.product_id, listing.listing_id, fingerprint,
@@ -1000,6 +1031,8 @@ class ListingDatabase:
                 int(classification.is_computer_part) if classification else None,
                 classification.normalized_product_name if classification else None,
                 status, classification.scope if classification else "unknown",
+                classification.sale_status if classification else "unknown",
+                int(classification.usable_for_market_price) if classification else 0,
                 classification.confidence if classification else None,
                 int(classification.reject) if classification else 1,
                 classification.reason if classification else (error_reason or "Codex CLI classification failed"),
@@ -1022,7 +1055,8 @@ class ListingDatabase:
             return None
         row = self.connection.execute(
             """
-            SELECT is_computer_part, normalized_product_name, condition_status, scope, confidence, reject, reason
+            SELECT is_computer_part, normalized_product_name, condition_status, scope,
+                   sale_status, usable_for_market_price, confidence, reject, reason
             FROM ai_classifications
             WHERE marketplace = ? AND product_id = ? AND classification_fingerprint = ?
               AND model = ? AND reasoning_effort = ? AND classifier_version = ? AND success = 1
@@ -1045,6 +1079,7 @@ class ListingDatabase:
             str(row["normalized_product_name"]) if row["normalized_product_name"] else None,
             str(row["condition_status"]), float(row["confidence"]),
             bool(row["reject"]), str(row["reason"]), str(row["scope"]),
+            str(row["sale_status"]), bool(row["usable_for_market_price"]),
         )
 
     def has_price_observation(self, marketplace: str, product_id: str, normalized_name: str) -> bool:

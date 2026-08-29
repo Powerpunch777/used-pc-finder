@@ -26,6 +26,8 @@ class Listing:
     canonical_url: str | None = None
     listing_status: str = "active"
     ai_scope: str = "unknown"
+    ai_sale_status: str = "unknown"
+    ai_usable_for_market_price: bool = False
     last_active_at: str | None = None
     first_sold_seen_at: str | None = None
     last_active_price: int | None = None

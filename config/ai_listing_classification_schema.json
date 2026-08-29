@@ -2,9 +2,8 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "is_computer_part": {"type": "boolean"},
     "normalized_product_name": {"type": ["string", "null"]},
-    "condition_status": {
+    "condition": {
       "type": "string",
       "enum": ["normal", "risky", "broken", "unknown"]
     },
@@ -15,14 +14,20 @@
       "type": "string",
       "enum": ["standalone", "bundle", "complete_pc", "accessory", "unknown"]
     }
+    ,"sale_status": {
+      "type": "string",
+      "enum": ["active", "reserved", "sold", "unavailable", "unknown"]
+    },
+    "usable_for_market_price": {"type": "boolean"}
   },
   "required": [
-    "is_computer_part",
     "normalized_product_name",
-    "condition_status",
+    "condition",
     "confidence",
     "reject",
     "reason",
-    "scope"
+    "scope",
+    "sale_status",
+    "usable_for_market_price"
   ]
 }

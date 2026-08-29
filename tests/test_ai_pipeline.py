@@ -11,7 +11,7 @@ from used_pc_finder.models import Listing
 
 def listing(product_id: str = "1", **changes) -> Listing:
     item = Listing(
-        "ASUS RTX 3070 그래픽카드", 320_000,
+        "그래픽카드 판매", 320_000,
         f"https://example.test/{product_id}", "", "bunjang_search",
         f"bunjang:{product_id}", "정상 작동, 수리 이력 없음", "normal",
         marketplace="bunjang", product_id=product_id,
@@ -64,6 +64,28 @@ class AiPipelineTests(unittest.TestCase):
         self.assertEqual(result.ai_normalized_product_name, "RTX 3070")
         self.assertEqual(stats.accepted_normal, 1)
         self.assertEqual(stats.classified_listings, [result])
+
+    def test_clear_standalone_part_passes_without_ai(self):
+        classifier = FakeClassifier(normal_attempt())
+        clear = replace(listing(), title="ASUS RTX 3070", description="정상 작동")
+        result = self.processor(classifier)(clear)
+        self.assertFalse(result.ai_reject)
+        self.assertTrue(result.ai_usable_for_market_price)
+        self.assertEqual(result.ai_normalized_product_name, "RTX 3070")
+        self.assertEqual(classifier.calls, 0)
+
+    def test_ai_must_mark_an_ambiguous_listing_usable_and_active(self):
+        rejected = ClassificationAttempt(
+            AIClassification(
+                True, "RTX 3070", "normal", 0.99, False, "reserved", "standalone",
+                "reserved", False,
+            ),
+            0.01,
+            None,
+        )
+        result = self.processor(FakeClassifier(rejected))(listing())
+        self.assertTrue(result.ai_reject)
+        self.assertFalse(result.ai_usable_for_market_price)
 
     def test_low_confidence_result_becomes_unknown(self):
         result = self.processor(FakeClassifier(normal_attempt(0.84)))(listing())
@@ -175,6 +197,11 @@ class AiPipelineTests(unittest.TestCase):
         processor(replace(original, description="정상 작동, 써멀 재도포 완료"))
         self.assertEqual(classifier.calls, 2)
         self.assertEqual(stats.cached, 1)
+        row = self.database.connection.execute(
+            "SELECT sale_status, usable_for_market_price FROM ai_classifications "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("active", 1))
 
     def test_timeout_subprocess_and_unavailable_model_fail_closed(self):
         for error in ("timeout", "subprocess failure", "model unavailable"):

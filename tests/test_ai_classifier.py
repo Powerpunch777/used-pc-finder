@@ -22,10 +22,11 @@ def listing() -> Listing:
 
 def valid_result() -> dict[str, object]:
     return {
-        "is_computer_part": True,
         "normalized_product_name": "RTX 4070 SUPER",
-        "condition_status": "normal",
+        "condition": "normal",
+        "sale_status": "active",
         "confidence": 0.98,
+        "usable_for_market_price": True,
         "reject": False,
         "reason": "Complete, working graphics card.",
         "scope": "standalone",

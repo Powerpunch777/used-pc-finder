@@ -103,7 +103,7 @@ class PipelineTests(unittest.TestCase):
                 return None
 
         item = Listing(
-            "RTX 4070 SUPER 팝니다",
+            "그래픽카드 판매",
             500000,
             "https://example/failed-ai",
             "Haan",

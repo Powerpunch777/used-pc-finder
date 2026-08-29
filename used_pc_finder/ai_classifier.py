@@ -15,12 +15,15 @@ from .models import Listing
 
 LOGGER = logging.getLogger(__name__)
 _STATUSES = frozenset({"normal", "risky", "broken", "unknown"})
+_SALE_STATUSES = frozenset({"active", "reserved", "sold", "unavailable", "unknown"})
 _SCOPES = frozenset({"standalone", "bundle", "complete_pc", "accessory", "unknown"})
-CLASSIFIER_VERSION = "codex-cli-listing-v2"
+CLASSIFIER_VERSION = "codex-cli-listing-v3"
 
 
 @dataclass(frozen=True, slots=True)
 class AIClassification:
+    # is_computer_part remains an internal compatibility field.  The model's
+    # schema deliberately no longer asks it a vague duplicate question.
     is_computer_part: bool
     normalized_product_name: str | None
     condition_status: str
@@ -28,6 +31,8 @@ class AIClassification:
     reject: bool
     reason: str
     scope: str = "unknown"
+    sale_status: str = "active"
+    usable_for_market_price: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,10 +48,13 @@ Do not use tools, commands, web access, browser automation, files, or external
 knowledge lookup. Do not browse any marketplace. Return only the JSON required by the
 provided schema.
 
-Accept only a genuine, complete computer part. Reject accessory-only, box-only,
-parts-only, repair-needed, incomplete, untested, ambiguous, and unrelated
-listings. Use condition_status normal, risky, broken, or unknown. Set reject true
-unless the listing is a complete, working computer part with a clear identity.
+Decide whether this listing can be used as one market-price observation. Reject
+accessory-only, box-only, parts-only, repair-needed, incomplete, untested,
+unrelated, sold, unavailable, model-mismatched, and uncertain listings. Use
+condition normal, risky, broken, or unknown. Use sale_status active, reserved,
+sold, unavailable, or unknown. Set usable_for_market_price true only when the
+listing is active, normal, a standalone complete part, has a clear canonical
+identity, and you are highly confident. Set reject true for every other listing.
 For normalized_product_name, return a concise canonical product model suitable for
 price matching (for example, \"RTX 4070 SUPER\"), or null if uncertain.
 
@@ -163,35 +171,39 @@ class CodexCliClassifier:
 
 def _parse_result(raw: Any) -> AIClassification:
     if not isinstance(raw, dict) or set(raw) != {
-        "is_computer_part",
         "normalized_product_name",
-        "condition_status",
+        "condition",
         "confidence",
         "reject",
         "reason",
         "scope",
+        "sale_status",
+        "usable_for_market_price",
     }:
         raise ValueError("classification does not match the required keys")
     normalized = raw["normalized_product_name"]
     confidence = raw["confidence"]
     if (
-        not isinstance(raw["is_computer_part"], bool)
-        or not (isinstance(normalized, str) or normalized is None)
-        or raw["condition_status"] not in _STATUSES
+        not (isinstance(normalized, str) or normalized is None)
+        or raw["condition"] not in _STATUSES
         or isinstance(confidence, bool)
         or not isinstance(confidence, (int, float))
         or not 0 <= confidence <= 1
         or not isinstance(raw["reject"], bool)
         or not isinstance(raw["reason"], str)
         or raw["scope"] not in _SCOPES
+        or raw["sale_status"] not in _SALE_STATUSES
+        or not isinstance(raw["usable_for_market_price"], bool)
     ):
         raise ValueError("classification has invalid field values")
     return AIClassification(
-        raw["is_computer_part"],
+        raw["scope"] == "standalone" and normalized is not None,
         normalized.strip() if isinstance(normalized, str) else None,
-        raw["condition_status"],
+        raw["condition"],
         float(confidence),
         raw["reject"],
         raw["reason"].strip(),
         raw["scope"],
+        raw["sale_status"],
+        raw["usable_for_market_price"],
     )

@@ -104,6 +104,8 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
             raise ValueError("AI classification confidence_threshold must be from 0 to 1")
         if int(ai_settings["ai_concurrency"]) < 1:
             raise ValueError("AI classification ai_concurrency must be positive")
+        if float(ai_settings.get("progress_interval_seconds", 10)) <= 0:
+            raise ValueError("AI classification progress_interval_seconds must be positive")
     email_settings = settings.get("email_notifications", {"enabled": False})
     if not isinstance(email_settings, dict):
         raise ValueError("email_notifications must be an object")

@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ from .market_estimator import (
 from .models import Deal, Listing
 from .notifications import EmailNotifier, send_unnotified_deal_digest
 from .pre_ai_filter import cheap_listing_scope, cheap_rejection_reason
+from .pre_ai_filter import deterministic_standalone_name
 from .pricing import comparable_product_name, discount_percent, find_deals
 from .parser import normalize_product_name
 from .secrets import load_smtp_password, setup_smtp_password
@@ -126,6 +128,96 @@ class FullBackfillResult:
     ai_failures: int
     max_concurrency_observed: int
     elapsed_seconds: float
+
+
+class BackfillProgressReporter:
+    """Rate-smoothed progress lines for backfills and other long scans."""
+
+    def __init__(
+        self,
+        total_queries: int,
+        *,
+        emit: Callable[[str], None] = print,
+        interval_seconds: float = 10.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.total_queries = total_queries
+        self.emit = emit
+        self.interval_seconds = interval_seconds
+        self.clock = clock
+        self.started = clock()
+        self.last_emitted = float("-inf")
+        self._recent_rates: deque[tuple[float, int]] = deque(maxlen=8)
+        self._durations: deque[float] = deque(maxlen=20)
+
+    def add_ai_duration(self, seconds: float) -> None:
+        if seconds >= 0:
+            self._durations.append(seconds)
+
+    def _eta(
+        self, *, completed_queries: int, processed_units: int, crawl_complete: bool,
+        queue_size: int, active_workers: int, concurrency: int,
+    ) -> str:
+        now = self.clock()
+        if crawl_complete:
+            if not self._durations or concurrency < 1:
+                return "calculating"
+            pending = queue_size + active_workers
+            return f"{(pending / concurrency) * (sum(self._durations) / len(self._durations)):.1f}"
+        self._recent_rates.append((now, processed_units))
+        if len(self._recent_rates) < 3 or completed_queries < 1:
+            return "calculating"
+        oldest_time, oldest_units = self._recent_rates[0]
+        elapsed = now - oldest_time
+        rate = (processed_units - oldest_units) / elapsed if elapsed > 0 else 0.0
+        if rate <= 0:
+            return "calculating"
+        # Query sizes differ, so use recent completed-query throughput only as a
+        # deliberately conservative crawl ETA until the cursor is exhausted.
+        remaining_queries = max(0, self.total_queries - completed_queries)
+        average_units_per_query = processed_units / max(1, completed_queries)
+        return f"{(remaining_queries * average_units_per_query) / rate:.1f}"
+
+    def report(
+        self,
+        *,
+        completed_queries: int,
+        pages_scanned: int,
+        listings_inspected: int,
+        valid_observations: int,
+        excluded_listings: int,
+        ai_queue_size: int,
+        active_ai_workers: int,
+        ai_completed: int,
+        ai_failures: int,
+        concurrency: int,
+        crawl_status: str,
+        crawl_complete: bool = False,
+        force: bool = False,
+    ) -> None:
+        now = self.clock()
+        if not force and now - self.last_emitted < self.interval_seconds:
+            return
+        self.last_emitted = now
+        average = sum(self._durations) / len(self._durations) if self._durations else None
+        eta = self._eta(
+            completed_queries=completed_queries,
+            processed_units=listings_inspected + ai_completed,
+            crawl_complete=crawl_complete,
+            queue_size=ai_queue_size,
+            active_workers=active_ai_workers,
+            concurrency=concurrency,
+        )
+        average_text = f"{average:.3f}" if average is not None else "calculating"
+        self.emit(
+            f"BACKFILL_LIVE | completed_queries={completed_queries}/{self.total_queries} | "
+            f"pages_scanned={pages_scanned} | listings_inspected={listings_inspected} | "
+            f"valid_observations={valid_observations} | excluded_listings={excluded_listings} | "
+            f"ai_queue_size={ai_queue_size} | active_ai_workers={active_ai_workers} | "
+            f"ai_completed={ai_completed} | ai_failures={ai_failures} | "
+            f"rolling_avg_ai_seconds={average_text} | elapsed_seconds={now - self.started:.1f} | "
+            f"crawl_status={crawl_status} | estimated_remaining_seconds={eta}"
+        )
 
 
 def format_deal(deal: Deal) -> str:
@@ -318,8 +410,11 @@ def classify_new_listing(
             ai_reason=rejection_reason,
             ai_scope=cheap_listing_scope(listing) or listing.ai_scope,
         )
+    deterministic_name = deterministic_standalone_name(listing)
+    if deterministic_name:
+        return _deterministic_accept(listing, deterministic_name)
     if classifier is None:
-        return listing
+        return _failed_ai_listing(listing, "AI review is unavailable for an ambiguous listing")
     if hasattr(classifier, "classify_attempt"):
         attempt = classifier.classify_attempt(listing)
         result = attempt.classification
@@ -328,14 +423,7 @@ def classify_new_listing(
         result = classifier.classify(listing)
         error = None
     if result is None:
-        return replace(
-            listing,
-            condition_status="unknown",
-            ai_is_computer_part=False,
-            ai_confidence=0.0,
-            ai_reject=True,
-            ai_reason=error or "Codex CLI classification failed",
-        )
+        return _failed_ai_listing(listing, error or "Codex CLI classification failed")
     return _apply_ai_classification(listing, result, ai_settings)
 
 
@@ -359,6 +447,8 @@ def _apply_ai_classification(
         or result.condition_status != "normal"
         or result.confidence < minimum_confidence
         or not canonical_name
+        or result.sale_status != "active"
+        or not result.usable_for_market_price
     )
     reason = result.reason
     if result.normalized_product_name and not canonical_name:
@@ -375,6 +465,37 @@ def _apply_ai_classification(
         ai_reject=reject,
         ai_reason=reason,
         ai_scope=result.scope,
+        ai_sale_status=result.sale_status,
+        ai_usable_for_market_price=result.usable_for_market_price and not reject,
+    )
+
+
+def _deterministic_accept(listing: Listing, normalized_name: str) -> Listing:
+    """Mark a clearly identified active standalone part without an AI call."""
+    return replace(
+        listing,
+        condition_status="normal",
+        ai_is_computer_part=True,
+        ai_normalized_product_name=normalized_name,
+        ai_confidence=1.0,
+        ai_reject=False,
+        ai_reason="rule-based clear active standalone part",
+        ai_scope="standalone",
+        ai_sale_status="active",
+        ai_usable_for_market_price=True,
+    )
+
+
+def _failed_ai_listing(listing: Listing, reason: str) -> Listing:
+    return replace(
+        listing,
+        condition_status="unknown",
+        ai_is_computer_part=False,
+        ai_confidence=0.0,
+        ai_reject=True,
+        ai_reason=reason,
+        ai_sale_status="unknown",
+        ai_usable_for_market_price=False,
     )
 
 
@@ -405,9 +526,16 @@ class AiListingProcessor:
                 ai_reject=True,
                 ai_reason=rejection_reason,
                 ai_scope=cheap_listing_scope(candidate) or candidate.ai_scope,
+                ai_sale_status=candidate.listing_status,
+                ai_usable_for_market_price=False,
             )
+        if deterministic_name := deterministic_standalone_name(candidate):
+            classified = _deterministic_accept(candidate, deterministic_name)
+            self.stats.accepted_normal += 1
+            self.stats.classified_listings.append(classified)
+            return classified
         if self.classifier is None:
-            return candidate
+            return _failed_ai_listing(candidate, "AI review is unavailable for an ambiguous listing")
         self.stats.candidates += 1
         fingerprint = classification_fingerprint(candidate)
         cached = self.database.cached_ai_classification(
@@ -426,6 +554,7 @@ class AiListingProcessor:
             classified.ai_is_computer_part
             and not classified.ai_reject
             and classified.condition_status == "normal"
+            and classified.ai_usable_for_market_price
             and (classified.ai_confidence or 0.0)
             >= float(self.ai_settings["confidence_threshold"])
         ):
@@ -452,14 +581,7 @@ class AiListingProcessor:
         )
         if attempt.classification is None:
             self.stats.failures += 1
-            failed = replace(
-                candidate,
-                condition_status="unknown",
-                ai_is_computer_part=False,
-                ai_confidence=0.0,
-                ai_reject=True,
-                ai_reason=attempt.error or "Codex CLI classification failed",
-            )
+            failed = _failed_ai_listing(candidate, attempt.error or "Codex CLI classification failed")
             self.stats.classified_listings.append(failed)
             return failed
         classified = _apply_ai_classification(candidate, attempt.classification, self.ai_settings)
@@ -467,6 +589,7 @@ class AiListingProcessor:
             classified.ai_is_computer_part
             and not classified.ai_reject
             and classified.condition_status == "normal"
+            and classified.ai_usable_for_market_price
             and (classified.ai_confidence or 0.0)
             >= float(self.ai_settings["confidence_threshold"])
         ):
@@ -499,6 +622,7 @@ def run_ai_worker_pool(
     queued: Sequence[QueuedAiClassification],
     concurrency: int,
     on_complete: Callable[[QueuedAiClassification, Listing], None] | None = None,
+    on_update: Callable[[AiPoolTelemetry], None] | None = None,
 ) -> AiPoolTelemetry:
     """Continuously refill a bounded AI worker pool as each task completes."""
     if concurrency < 1:
@@ -528,7 +652,11 @@ def run_ai_worker_pool(
         while len(futures) < concurrency and submit_next(executor):
             pass
         while futures:
-            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            completed, _ = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+            if not completed:
+                if on_update is not None:
+                    on_update(telemetry)
+                continue
             for future in completed:
                 work = futures.pop(future)
                 telemetry.active_workers -= 1
@@ -554,8 +682,88 @@ def run_ai_worker_pool(
                 )
                 if on_complete is not None:
                     on_complete(work, result)
+                if on_update is not None:
+                    on_update(telemetry)
     telemetry.wall_clock_seconds = time.monotonic() - started
     return telemetry
+
+
+class StreamingAiWorkerPool:
+    """A bounded pool that lets the crawler keep filling an AI review queue."""
+
+    def __init__(
+        self,
+        concurrency: int,
+        on_complete: Callable[[QueuedAiClassification, Listing], None],
+        on_update: Callable[[AiPoolTelemetry], None] | None = None,
+    ) -> None:
+        if concurrency < 1:
+            raise ValueError("AI concurrency must be positive")
+        self.concurrency = concurrency
+        self.on_complete = on_complete
+        self.on_update = on_update
+        self.telemetry = AiPoolTelemetry()
+        self._waiting: deque[QueuedAiClassification] = deque()
+        self._futures: dict[Future[tuple[ClassificationAttempt, str, str]], QueuedAiClassification] = {}
+        self._executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="codex-ai")
+        self._closed = False
+
+    def submit(self, work: QueuedAiClassification) -> None:
+        self._waiting.append(work)
+        self.telemetry.initial_queue_length += 1
+        self._refill()
+        self._publish()
+
+    def _refill(self) -> None:
+        while self._waiting and len(self._futures) < self.concurrency:
+            work = self._waiting.popleft()
+            self._futures[self._executor.submit(_run_ai_task, work)] = work
+        self.telemetry.queue_length = len(self._waiting)
+        self.telemetry.active_workers = len(self._futures)
+        self.telemetry.max_concurrency_observed = max(
+            self.telemetry.max_concurrency_observed, self.telemetry.active_workers
+        )
+
+    def _complete(self, future: Future[tuple[ClassificationAttempt, str, str]]) -> None:
+        work = self._futures.pop(future)
+        try:
+            attempt, task_started, task_finished = future.result()
+        except Exception as exc:
+            now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            attempt, task_started, task_finished = ClassificationAttempt(None, 0.0, str(exc)), now, now
+        result = work.processor.complete(work.listing, attempt)
+        self.telemetry.completed_calls += 1
+        self.telemetry.failures += int(attempt.classification is None)
+        self.telemetry.subprocess_execution_seconds += attempt.execution_seconds
+        self.telemetry.task_timings.append(
+            AiTaskTiming(work.listing.product_id, task_started, task_finished,
+                         attempt.execution_seconds, attempt.classification is None)
+        )
+        self.on_complete(work, result)
+
+    def poll(self) -> None:
+        for future in [future for future in self._futures if future.done()]:
+            self._complete(future)
+        self._refill()
+        self._publish()
+
+    def finish(self) -> AiPoolTelemetry:
+        started = time.monotonic()
+        while self._futures or self._waiting:
+            if self._futures:
+                done, _ = wait(self._futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    self._complete(future)
+            self._refill()
+            self._publish()
+        self.telemetry.wall_clock_seconds += time.monotonic() - started
+        self._executor.shutdown(wait=True)
+        self._closed = True
+        return self.telemetry
+
+    def _publish(self) -> None:
+        if self.on_update is not None:
+            self.on_update(self.telemetry)
 
 
 def build_ai_classifier(settings: dict[str, object]) -> CodexCliClassifier | None:
@@ -621,6 +829,10 @@ def backfill_market_price(
             reason = f"scope:{listing.ai_scope}"
         elif listing.ai_reject or listing.ai_is_computer_part is not True:
             reason = "ai_rejected"
+        elif not listing.ai_usable_for_market_price:
+            reason = "not_usable_for_market_price"
+        elif (listing.ai_confidence or 0.0) < float(ai_settings["confidence_threshold"]):
+            reason = "low_confidence"
         elif listing.ai_normalized_product_name != target_name:
             reason = "misclassified_product"
         if reason:
@@ -758,7 +970,7 @@ def track_sale_statuses(
     )
 
 
-def _backfill_exclusion_reason(listing: Listing) -> str:
+def _backfill_exclusion_reason(listing: Listing, confidence_threshold: float = 0.85) -> str:
     if listing.listing_status != "active":
         return f"status:{listing.listing_status}"
     if listing.condition_status != "normal":
@@ -767,6 +979,10 @@ def _backfill_exclusion_reason(listing: Listing) -> str:
         return f"scope:{listing.ai_scope}"
     if listing.ai_reject or listing.ai_is_computer_part is not True:
         return "ai_rejected"
+    if not listing.ai_usable_for_market_price:
+        return "not_usable_for_market_price"
+    if (listing.ai_confidence or 0.0) < confidence_threshold:
+        return "low_confidence"
     if not listing.ai_normalized_product_name:
         return "model_mismatched"
     return ""
@@ -802,6 +1018,38 @@ def run_full_market_price_backfill(
     ai_settings = dict(settings.get("ai_classification", {"enabled": False}))
     total_inspected = total_valid = total_excluded = total_ai_calls = total_ai_failures = 0
     max_concurrency = completed_queries = incomplete_queries = 0
+    total_pages_scanned = 0
+    ai_concurrency = int(ai_settings.get("ai_concurrency", 4))
+    reporter = BackfillProgressReporter(
+        len(sources), emit=progress,
+        interval_seconds=float(ai_settings.get("progress_interval_seconds", 10.0)),
+    )
+
+    def report_live(
+        crawl_status: str,
+        telemetry: AiPoolTelemetry | None = None,
+        *,
+        crawl_complete: bool = False,
+        force: bool = False,
+    ) -> None:
+        pool = telemetry or AiPoolTelemetry()
+        reporter.report(
+            completed_queries=completed_queries,
+            pages_scanned=total_pages_scanned,
+            listings_inspected=total_inspected,
+            valid_observations=total_valid,
+            excluded_listings=total_excluded,
+            ai_queue_size=pool.queue_length,
+            active_ai_workers=pool.active_workers,
+            ai_completed=total_ai_calls + pool.completed_calls,
+            ai_failures=total_ai_failures + pool.failures,
+            concurrency=ai_concurrency,
+            crawl_status=crawl_status,
+            crawl_complete=crawl_complete,
+            force=force,
+        )
+
+    report_live("starting", force=True)
 
     for source in sources:
         source_key = str(source["key"])
@@ -820,7 +1068,9 @@ def run_full_market_price_backfill(
         def persist(listing: Listing) -> None:
             nonlocal valid_observations, excluded
             database.store_backfill_listing(listing)
-            reason = _backfill_exclusion_reason(listing)
+            reason = _backfill_exclusion_reason(
+                listing, float(ai_settings.get("confidence_threshold", 0.85))
+            )
             if reason:
                 excluded += 1
             else:
@@ -873,9 +1123,17 @@ def run_full_market_price_backfill(
                 retry_queued.append(prepared)
             else:
                 persist(prepared)
+        retry_timing_count = 0
+
+        def report_retry_pool(pool: AiPoolTelemetry) -> None:
+            nonlocal retry_timing_count
+            for timing in pool.task_timings[retry_timing_count:]:
+                reporter.add_ai_duration(timing.execution_seconds)
+            retry_timing_count = len(pool.task_timings)
+            report_live("retrying_details", pool)
+
         retry_telemetry = run_ai_worker_pool(
-            retry_queued, int(ai_settings.get("ai_concurrency", 4)),
-            lambda _work, listing: persist(listing),
+            retry_queued, ai_concurrency, lambda _work, listing: persist(listing), report_retry_pool,
         )
         ai_calls += retry_telemetry.completed_calls
         ai_failures += retry_telemetry.failures
@@ -895,12 +1153,35 @@ def run_full_market_price_backfill(
             )
             progress(f"BACKFILL_QUERY | key={source_key} | status=already_complete")
             completed_queries += 1
+            report_live("query_already_complete", force=True)
             continue
+
+        query_valid_before, query_excluded_before = valid_observations, excluded
+        stream_timing_count = 0
+
+        def report_stream_pool(pool: AiPoolTelemetry) -> None:
+            nonlocal stream_timing_count
+            for timing in pool.task_timings[stream_timing_count:]:
+                reporter.add_ai_duration(timing.execution_seconds)
+            stream_timing_count = len(pool.task_timings)
+            report_live("crawling", pool)
+
+        stream_pool = StreamingAiWorkerPool(
+            ai_concurrency, lambda _work, listing: persist(listing), report_stream_pool
+        )
 
         while True:
             try:
                 page = crawler.search_page(query, checkpoint_key, cursor)
             except Exception as exc:
+                telemetry = stream_pool.finish()
+                ai_calls += telemetry.completed_calls
+                ai_failures += telemetry.failures
+                total_ai_calls += telemetry.completed_calls
+                total_ai_failures += telemetry.failures
+                max_concurrency = max(max_concurrency, telemetry.max_concurrency_observed)
+                total_valid += valid_observations - query_valid_before
+                total_excluded += excluded - query_excluded_before
                 database.update_backfill_checkpoint(
                     checkpoint_key, query, cursor=cursor, pages_scanned=pages,
                     unique_listings_found=unique_found, valid_observations=valid_observations,
@@ -908,6 +1189,7 @@ def run_full_market_price_backfill(
                     completed=False,
                 )
                 progress(f"BACKFILL_QUERY | key={source_key} | status=paused | error={type(exc).__name__}")
+                report_live("crawl_paused", force=True)
                 break
 
             page_seen: set[str] = set()
@@ -925,29 +1207,6 @@ def run_full_market_price_backfill(
             unique_found += len(candidates)
             total_inspected += len(candidates)
             processor = AiListingProcessor(database, classifier, ai_settings, AiScanStats())
-            page_valid = page_excluded = 0
-            queued: list[QueuedAiClassification] = []
-
-            def persist_page(listing: Listing) -> None:
-                nonlocal page_valid, page_excluded, valid_observations, excluded
-                database.store_backfill_listing(listing)
-                reason = _backfill_exclusion_reason(listing)
-                if reason:
-                    page_excluded += 1
-                    excluded += 1
-                else:
-                    normalized_name = listing.ai_normalized_product_name
-                    assert normalized_name is not None
-                    if not database.has_price_observation(
-                        listing.marketplace, listing.product_id or "", normalized_name
-                    ) and database.record_price_observation(listing, normalized_name):
-                        page_valid += 1
-                        valid_observations += 1
-                if listing.product_id:
-                    database.mark_backfill_product_seen(
-                        listing.marketplace, listing.product_id, checkpoint_key
-                    )
-                    database.clear_backfill_detail_retry(listing.marketplace, listing.product_id)
 
             for item in candidates:
                 try:
@@ -960,29 +1219,21 @@ def run_full_market_price_backfill(
                     continue
                 prepared = processor.prepare(detailed)
                 if isinstance(prepared, QueuedAiClassification):
-                    queued.append(prepared)
+                    stream_pool.submit(prepared)
                 else:
-                    persist_page(prepared)
-
-            telemetry = run_ai_worker_pool(
-                queued, int(ai_settings.get("ai_concurrency", 4)),
-                lambda _work, listing: persist_page(listing),
-            )
-            ai_calls += telemetry.completed_calls
-            ai_failures += telemetry.failures
-            total_ai_calls += telemetry.completed_calls
-            total_ai_failures += telemetry.failures
-            max_concurrency = max(max_concurrency, telemetry.max_concurrency_observed)
-            total_valid += page_valid
-            total_excluded += page_excluded
+                    persist(prepared)
+                # Detail HTTP failures never reach this pool; completed reviews
+                # are persisted while the crawler continues to later candidates.
+                stream_pool.poll()
             pages += 1
+            total_pages_scanned += 1
             cursor = page.next_cursor
             query_completed = cursor is None
             database.update_backfill_checkpoint(
                 checkpoint_key, query, cursor=cursor, pages_scanned=pages,
                 unique_listings_found=unique_found, valid_observations=valid_observations,
                 excluded_listings=excluded, ai_calls=ai_calls, ai_failures=ai_failures,
-                completed=query_completed,
+                completed=False,
             )
             target_name = normalize_product_name(query)
             estimate = (
@@ -997,10 +1248,29 @@ def run_full_market_price_backfill(
             )
             _print_backfill_detail_retry_statistics(database, checkpoint_key, source_key, progress)
             if query_completed:
+                report_live("crawl_complete_draining_ai", stream_pool.telemetry,
+                            crawl_complete=True, force=True)
+                telemetry = stream_pool.finish()
+                ai_calls += telemetry.completed_calls
+                ai_failures += telemetry.failures
+                total_ai_calls += telemetry.completed_calls
+                total_ai_failures += telemetry.failures
+                max_concurrency = max(max_concurrency, telemetry.max_concurrency_observed)
+                total_valid += valid_observations - query_valid_before
+                total_excluded += excluded - query_excluded_before
+                database.update_backfill_checkpoint(
+                    checkpoint_key, query, cursor=cursor, pages_scanned=pages,
+                    unique_listings_found=unique_found, valid_observations=valid_observations,
+                    excluded_listings=excluded, ai_calls=ai_calls, ai_failures=ai_failures,
+                    completed=True,
+                )
                 completed_queries += 1
+                report_live("query_complete", crawl_complete=True, force=True)
                 break
         if not query_completed:
             incomplete_queries += 1
+
+    report_live("complete", crawl_complete=True, force=True)
 
     return FullBackfillResult(
         total_inspected, total_valid, total_excluded, completed_queries, incomplete_queries,

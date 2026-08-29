@@ -11,7 +11,11 @@ _BUNDLE_MISMATCH_TERMS = ("bundle", "묶음", "일괄", "세트", "set ")
 
 def comparable_product_name(listing: Listing, *, require_ai: bool = False) -> str | None:
     """Return a normalized name only for listings safe to use as market evidence."""
-    if listing.listing_status != "active" or listing.ai_scope != "standalone":
+    if (
+        listing.listing_status != "active"
+        or listing.ai_sale_status not in {"active", "unknown"}
+        or listing.ai_scope != "standalone"
+    ):
         return None
     if listing.ai_reject or listing.ai_is_computer_part is False:
         return None

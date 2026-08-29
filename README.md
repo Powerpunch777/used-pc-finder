@@ -70,21 +70,34 @@ full-backfill invocation; it does not pause the page or query. Failed searches a
 logged and leave their cursor checkpoint unchanged for a later run.
 
 The Codex CLI classifier is enabled by default and uses the already authenticated
-ChatGPT Codex session—not `OPENAI_API_KEY`. It receives only crawler-collected
-listing data after the budget, de-duplication, ad, and deterministic-condition
-gates. It runs `gpt-5.6-luna` at `low` reasoning with a strict JSON schema, a
-90-second timeout, 0.85 confidence threshold, and a streaming worker pool of
-two concurrent calls by default; all values are editable in `ai_classification`.
+ChatGPT Codex session—not `OPENAI_API_KEY`. Deterministic rules first accept clear,
+active standalone parts and reject clear broken, unavailable, accessory, bundle,
+complete-PC, and model-mismatched listings. Only the remaining ambiguous listings
+enter the AI queue. It runs `gpt-5.6-luna` at `low` reasoning with a strict JSON
+schema, a 90-second timeout, 0.85 confidence threshold, and a streaming worker
+pool of four concurrent calls by default; all values are editable in
+`ai_classification`.
 Codex web search is not enabled
 and the prompt prohibits tools, browsing, and marketplace access.
 
-Only high-confidence, normal, non-rejected computer parts whose AI product name
-can be converted through the local canonical alias system can reach pricing. A
+Only high-confidence, active, normal, standalone, non-rejected parts explicitly
+marked usable for market price, whose product name can be converted through the
+local canonical alias system, can add market-price observations. A
 timeout, subprocess error, unsupported model, malformed output, or schema error
 fails closed and cannot notify; failures remain eligible for retry on a later scan.
 SQLite's `ai_classifications` table retains every actual result and
 failure with model, reasoning effort, content fingerprint, timestamp, duration,
 and classifier version; an unchanged fingerprint reuses a successful result.
+
+## Backfill progress
+
+Full market-price backfills print periodic `BACKFILL_LIVE` lines with query/page
+counts, listing and observation totals, exclusions, AI queue/worker statistics,
+rolling AI duration, elapsed time, crawl state, and a smoothed ETA. The ETA is
+`calculating` until there are enough recent samples; after crawling ends it uses
+the remaining queue, active workers, and recent AI duration for a more precise
+drain estimate. `ai_classification.progress_interval_seconds` controls the report
+interval. Crawling continues while up to `ai_concurrency` ambiguous reviews run.
 
 Reference prices are in `data/market_prices.json`; adjust
 `minimum_discount_percent` in `config/settings.json` to change the deal threshold.
