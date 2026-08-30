@@ -155,6 +155,22 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(message["From"], "sender@example.com")
         self.assertEqual(message["To"], "to@example.com")
 
+    def test_digest_includes_optional_second_stage_review_metadata(self):
+        message = build_deal_digest_email(
+            [deal()], {"RTX 4070 SUPER": "automatic"}, "sender@example.com", "to@example.com",
+            {"4070-super": {
+                "second_stage_confidence": 0.99,
+                "reason": "fixed price verified from current listing text",
+            }},
+        )
+
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("First-stage AI confidence: Not available", plain)
+        self.assertIn("Second-stage AI confidence: 99.0%", plain)
+        self.assertIn("fixed price verified from current listing text", plain)
+        self.assertIn("Second-stage AI confidence", html)
+
     def test_bunjang_url_falls_back_to_the_product_id_not_a_legacy_url(self):
         listing = Listing(
             "RTX 4070 SUPER",

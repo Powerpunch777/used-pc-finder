@@ -56,7 +56,11 @@ def _recent_and_non_outlying(
     center = median(prices)
     mad = median([abs(price - center) for price in prices])
     if mad == 0:
-        return [(observation, age) for observation, age in recent if observation.observed_price == center]
+        # A repeated merchant/stock price can make MAD zero even when other
+        # genuine market listings differ.  Keeping the recent sample avoids
+        # silently discarding every non-modal observation (as happened for
+        # Ryzen 5 7500F).  The weighted median remains robust to a lone extreme.
+        return recent
     scale = 1.4826 * mad
     return [
         (observation, age)

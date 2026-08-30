@@ -25,12 +25,16 @@ class PipelineTests(unittest.TestCase):
             Listing(
                 "3060ti", 270000, "https://example/1", "Haan", "local",
                 condition_status="normal",
-                ai_scope="standalone",
+                ai_scope="standalone", ai_is_computer_part=True,
+                ai_normalized_product_name="RTX 3060 Ti", ai_sale_status="active",
+                ai_usable_for_market_price=True, ai_usable_price=True, effective_price=270000,
             ),
             Listing(
                 "4070s", 480000, "https://example/2", "Haan", "buy_now",
                 condition_status="normal",
-                ai_scope="standalone",
+                ai_scope="standalone", ai_is_computer_part=True,
+                ai_normalized_product_name="RTX 4070 SUPER", ai_sale_status="active",
+                ai_usable_for_market_price=True, ai_usable_price=True, effective_price=480000,
             ),
         ]
         deals = find_deals(
@@ -53,10 +57,10 @@ class PipelineTests(unittest.TestCase):
         ]
         self.assertEqual(find_deals(listings, {"RTX 4070 SUPER": 600000}, 10), [])
 
-    def test_cheap_broken_rule_skips_the_ai_classifier(self):
-        class MustNotBeCalled:
+    def test_broken_listing_is_still_sent_to_first_stage_ai_and_rejected(self):
+        class RejectingClassifier:
             def classify(self, _listing):
-                raise AssertionError("AI must not receive broken listings")
+                return AIClassification(False, None, "broken", 0.99, True, "broken", "unknown")
 
         item = Listing(
             "RTX 4070 SUPER 고장",
@@ -68,16 +72,18 @@ class PipelineTests(unittest.TestCase):
             condition_status="broken",
         )
         classified = classify_new_listing(
-            item, MustNotBeCalled(), {"minimum_confidence": 0.9}
+            item, RejectingClassifier(), {"minimum_confidence": 0.9}
         )
         self.assertTrue(classified.ai_reject)
-        self.assertEqual(classified.ai_confidence, 0.0)
+        self.assertEqual(classified.ai_confidence, 0.99)
 
     def test_high_confidence_normal_ai_result_reaches_price_comparison(self):
         class Classifier:
             def classify(self, _listing):
                 return AIClassification(
-                    True, "RTX 4070 SUPER", "normal", 0.98, False, "Working GPU", "standalone"
+                    True, "RTX 4070 SUPER", "normal", 0.98, False, "Working GPU", "standalone",
+                    "active", True, True, "sale", False, False, 500000, 500000,
+                    "marketplace", 0.98, True,
                 )
 
         item = Listing(
@@ -122,7 +128,8 @@ class PipelineTests(unittest.TestCase):
             "RTX 4070 SUPER", 500000, "https://example/part", "Haan", "local",
             description="정상 작동", condition_status="normal", ai_is_computer_part=True,
             ai_normalized_product_name="RTX 4070 SUPER", ai_confidence=0.99,
-            ai_scope="standalone", listing_status="active",
+            ai_scope="standalone", listing_status="active", ai_sale_status="active",
+            ai_usable_for_market_price=True, ai_usable_price=True, effective_price=500000,
         )
         prices = {"RTX 4070 SUPER": 600000}
         self.assertEqual(len(find_deals([standalone], prices, 10, require_ai=True)), 1)

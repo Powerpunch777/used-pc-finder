@@ -1,33 +1,18 @@
 {
   "type": "object",
   "additionalProperties": false,
+  "required": ["normalized_product_name", "exact_product", "condition", "confidence", "reason", "scope", "sale_status", "model_mismatch", "price_bait", "hidden_price_condition", "displayed_price", "effective_price", "price_source", "price_confidence", "usable_price"],
   "properties": {
     "normalized_product_name": {"type": ["string", "null"]},
-    "condition": {
-      "type": "string",
-      "enum": ["normal", "risky", "broken", "unknown"]
-    },
+    "exact_product": {"type": "boolean"},
+    "condition": {"type": "string", "enum": ["normal", "risky", "broken", "unknown"]},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "reject": {"type": "boolean"},
     "reason": {"type": "string", "maxLength": 240},
-    "scope": {
-      "type": "string",
-      "enum": ["standalone", "bundle", "complete_pc", "accessory", "unknown"]
-    }
-    ,"sale_status": {
-      "type": "string",
-      "enum": ["active", "reserved", "sold", "unavailable", "unknown"]
-    },
-    "usable_for_market_price": {"type": "boolean"}
-  },
-  "required": [
-    "normalized_product_name",
-    "condition",
-    "confidence",
-    "reject",
-    "reason",
-    "scope",
-    "sale_status",
-    "usable_for_market_price"
-  ]
+    "scope": {"type": "string", "enum": ["standalone", "bundle", "complete_pc", "accessory", "unknown"]},
+    "sale_status": {"type": "string", "enum": ["active", "reserved", "sold", "unavailable", "unknown"]},
+    "model_mismatch": {"type": "boolean"}, "price_bait": {"type": "boolean"}, "hidden_price_condition": {"type": "boolean"},
+    "displayed_price": {"type": "integer", "minimum": 1}, "effective_price": {"type": ["integer", "null"], "minimum": 1},
+    "price_source": {"type": "string", "enum": ["marketplace", "description", "both", "unknown"]},
+    "price_confidence": {"type": "number", "minimum": 0, "maximum": 1}, "usable_price": {"type": "boolean"}
+  }
 }

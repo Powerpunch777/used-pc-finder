@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Used PC Finder incremental scan every 10 minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/10:00
+Persistent=true
+AccuracySec=1s
+Unit=used-pc-finder.service
+
+[Install]
+WantedBy=timers.target

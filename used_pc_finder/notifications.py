@@ -19,8 +19,15 @@ DEFAULT_PASSWORD_ENVIRONMENT_VARIABLE = "KARROT_SMTP_PASSWORD"
 BJUNJANG_PRODUCT_URL = "https://m.bunjang.co.kr/products/{product_id}"
 
 
-class DigestNotifier(Protocol):
-    def send_digest(self, deals: Sequence[Deal], pricing_sources: Mapping[str, str]) -> None: ...
+class Notifier(Protocol):
+    def send_digest(
+        self, deals: Sequence[Deal], pricing_sources: Mapping[str, str],
+        review_metadata: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None: ...
+
+
+# Compatibility name for injected test and third-party adapters.
+DigestNotifier = Notifier
 
 
 def bunjang_listing_url(deal: Deal) -> str:
@@ -49,6 +56,7 @@ def build_deal_digest_email(
     pricing_sources: Mapping[str, str],
     sender: str,
     recipient: str,
+    review_metadata: Mapping[str, Mapping[str, object]] | None = None,
 ) -> EmailMessage:
     """Build one multipart Bunjang digest, ordered by highest discount first."""
     ordered_deals = _sorted_deals(deals)
@@ -61,13 +69,24 @@ def build_deal_digest_email(
         listing = deal.listing
         listing_url = bunjang_listing_url(deal)
         pricing_source = pricing_sources.get(deal.normalized_name, "manual")
+        review = (review_metadata or {}).get(listing.product_id or "", {})
+        second_confidence = review.get("second_stage_confidence")
+        second_confidence_text = (
+            f"{float(second_confidence) * 100:.1f}%"
+            if isinstance(second_confidence, (int, float)) and not isinstance(second_confidence, bool)
+            else "Not available"
+        )
+        review_reason = str(review.get("reason", "")).strip() or "Not available"
         fields = (
             ("Product", deal.normalized_name),
-            ("Listing price", f"{listing.price:,} KRW"),
+            ("Displayed listing price", f"{listing.price:,} KRW"),
+            ("Effective price", f"{(deal.effective_price or listing.price):,} KRW"),
             ("Reference market price", f"{deal.reference_price:,} KRW"),
             ("Discount", f"{deal.discount_percent:.1f}%"),
             ("Condition", listing.condition_status),
-            ("AI confidence", _confidence_text(deal)),
+            ("First-stage AI confidence", _confidence_text(deal)),
+            ("Second-stage AI confidence", second_confidence_text),
+            ("Final review reason", review_reason),
             ("Pricing source", pricing_source),
         )
         text_lines.append(f"{index}. {deal.normalized_name}")
@@ -78,10 +97,13 @@ def build_deal_digest_email(
             f"<td>{index}</td>"
             f"<td>{html.escape(deal.normalized_name)}</td>"
             f"<td>{listing.price:,} KRW</td>"
+            f"<td>{(deal.effective_price or listing.price):,} KRW</td>"
             f"<td>{deal.reference_price:,} KRW</td>"
             f"<td>{deal.discount_percent:.1f}%</td>"
             f"<td>{html.escape(listing.condition_status)}</td>"
             f"<td>{html.escape(_confidence_text(deal))}</td>"
+            f"<td>{html.escape(second_confidence_text)}</td>"
+            f"<td>{html.escape(review_reason)}</td>"
             f"<td>{html.escape(pricing_source)}</td>"
             f"<td><a href=\"{html.escape(listing_url, quote=True)}\">Open listing</a></td>"
             "</tr>"
@@ -90,9 +112,10 @@ def build_deal_digest_email(
     html_body = (
         "<html><body><h2>Bunjang computer-parts deal digest</h2>"
         "<table><thead><tr>"
-        "<th>#</th><th>Product</th><th>Listing price</th>"
+        "<th>#</th><th>Product</th><th>Displayed listing price</th><th>Effective price</th>"
         "<th>Reference market price</th><th>Discount</th><th>Condition</th>"
-        "<th>AI confidence</th><th>Pricing source</th><th>Bunjang listing</th>"
+        "<th>First-stage AI confidence</th><th>Second-stage AI confidence</th>"
+        "<th>Final review reason</th><th>Pricing source</th><th>Bunjang listing</th>"
         "</tr></thead><tbody>"
         f"{''.join(html_rows)}"
         "</tbody></table></body></html>"
@@ -140,7 +163,10 @@ class EmailNotifier:
             use_starttls=bool(settings.get("use_starttls", True)),
         )
 
-    def send_digest(self, deals: Sequence[Deal], pricing_sources: Mapping[str, str]) -> None:
+    def send_digest(
+        self, deals: Sequence[Deal], pricing_sources: Mapping[str, str],
+        review_metadata: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
         password = os.environ.get(self.password_environment_variable)
         if not password:
             raise ValueError(
@@ -148,7 +174,7 @@ class EmailNotifier:
                 f"{self.password_environment_variable}"
             )
         message = build_deal_digest_email(
-            deals, pricing_sources, self.sender_address, self.recipient_address
+            deals, pricing_sources, self.sender_address, self.recipient_address, review_metadata,
         )
         with self.smtp_factory(self.smtp_host, self.smtp_port, timeout=20) as client:
             client.ehlo()
@@ -159,12 +185,23 @@ class EmailNotifier:
             client.send_message(message)
 
 
+class KakaoNotifier:
+    """Reserved notifier implementation boundary; no Kakao service is enabled."""
+
+    def send_digest(
+        self, deals: Sequence[Deal], pricing_sources: Mapping[str, str],
+        review_metadata: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
+        raise NotImplementedError("KakaoNotifier is not configured in this deployment")
+
+
 def send_unnotified_deal_digest(
     deals: Sequence[Deal],
     database: ListingDatabase,
     email_settings: Mapping[str, Any],
     pricing_sources: Mapping[str, str],
     notifier: DigestNotifier | None = None,
+    review_metadata: Mapping[str, Mapping[str, object]] | None = None,
 ) -> int:
     """Send one digest after a scan and record all included listings on SMTP success."""
     if not email_settings.get("enabled", False):
@@ -180,10 +217,15 @@ def send_unnotified_deal_digest(
         return 0
     sender = notifier or EmailNotifier.from_settings(dict(email_settings))
     try:
-        sender.send_digest(pending, pricing_sources)
+        if review_metadata is None:
+            # Preserve compatibility with existing two-argument notifier adapters.
+            sender.send_digest(pending, pricing_sources)
+        else:
+            sender.send_digest(pending, pricing_sources, review_metadata)
     except Exception:
         LOGGER.exception("Unable to send Bunjang deal digest")
         return 0
     for deal in pending:
         database.mark_notified(deal.listing)
+    database.record_notification_delivery(len(pending), channel="email")
     return len(pending)

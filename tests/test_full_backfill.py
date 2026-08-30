@@ -65,7 +65,11 @@ class FakeClassifier:
     def classify_attempt(self, value):
         scope = "standalone" if value.product_id == "valid" else "bundle"
         return ClassificationAttempt(
-            AIClassification(True, "RTX 3070", "normal", 0.99, False, scope, scope),
+            AIClassification(
+                True, "RTX 3070", "normal", 0.99, scope != "standalone", scope, scope,
+                "active", scope == "standalone", scope == "standalone", "sale", False,
+                False, value.price, value.price, "marketplace", 0.99, scope == "standalone",
+            ),
             0.01,
             None,
         )

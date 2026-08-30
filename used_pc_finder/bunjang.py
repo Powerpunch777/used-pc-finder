@@ -277,9 +277,7 @@ class BunjangCrawler:
         """Fetch details only after the database marks a Bunjang record new or changed."""
         if listing.product_id is None:
             raise ValueError("Bunjang detail request requires product_id")
-        self.detail_requests += 1
-        payload = self._get(DETAIL_URL.format(product_id=listing.product_id))
-        product = payload["data"]["product"]
+        product = self.fetch_product_detail(listing.product_id)
         description = str(product.get("description", "")).strip()
         title = str(product.get("name", listing.title)).strip()
         price = int(product.get("price", listing.price))
@@ -290,9 +288,20 @@ class BunjangCrawler:
             price=price,
             description=description,
             condition_status=status,
-            listing_status=listing_status(product.get("status", listing.listing_status)),
+            listing_status=listing_status(
+                product.get("saleStatus", product.get("status", listing.listing_status))
+            ),
             # The search response is the public incremental-scan authority. Its
             # timestamps have coarser precision than the detail endpoint, so
             # replacing this value would make an unchanged product look changed.
             updated_at=listing.updated_at,
         )
+
+    def fetch_product_detail(self, product_id: str) -> dict[str, Any]:
+        """Fetch one current public product payload without mutating local state."""
+        self.detail_requests += 1
+        payload = self._get(DETAIL_URL.format(product_id=product_id))
+        product = payload["data"]["product"]
+        if not isinstance(product, dict):
+            raise ValueError("Bunjang detail payload has no product object")
+        return product

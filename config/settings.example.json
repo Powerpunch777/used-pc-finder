@@ -1,0 +1,56 @@
+{
+  "locations": ["YOUR_LOCATION"],
+  "minimum_discount_percent": 10.0,
+  "maximum_listing_price": 500000,
+  "request_delay_seconds": 2.0,
+  "request_timeout_seconds": 10.0,
+  "active_marketplace": "bunjang",
+  "user_agent": "used_pc_finder/1.0 (personal public-page reader)",
+  "market_price_estimation": {
+    "window_days": 90,
+    "half_life_days": 21,
+    "minimum_observations": 5,
+    "estimator": "weighted_median"
+  },
+  "ai_classification": {
+    "enabled": true,
+    "command": "codex",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "low",
+    "confidence_threshold": 0.9,
+    "timeout_seconds": 90,
+    "ai_concurrency": 4,
+    "recovery_timeout_seconds": 900,
+    "progress_interval_seconds": 10,
+    "schema_path": "config/ai_listing_classification_schema.json"
+  },
+  "final_email_review": {
+    "enabled": true,
+    "command": "codex",
+    "model": "gpt-5.6-terra",
+    "reasoning_effort": "high",
+    "confidence_threshold": 0.9,
+    "timeout_seconds": 180,
+    "schema_path": "config/final_email_review_schema.json"
+  },
+  "sale_status_tracking": {
+    "recent_age_days": 3,
+    "medium_age_days": 14,
+    "recent_interval_hours": 6,
+    "medium_interval_hours": 24,
+    "older_interval_hours": 168
+  },
+  "email_notifications": {
+    "enabled": false,
+    "recipient_address": "YOUR_RECIPIENT@example.com",
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "sender_address": "YOUR_SENDER@example.com",
+    "password_environment_variable": "KARROT_SMTP_PASSWORD",
+    "use_starttls": true
+  },
+  "bunjang_sources": [
+    {"key": "example_gpu", "query": "RTX 3060 Ti", "max_pages": 2, "watermark_overlap_pages": 1}
+  ],
+  "legacy_karrot_sources": []
+}

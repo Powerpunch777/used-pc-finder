@@ -35,7 +35,11 @@ class FakeClassifier:
 
 def normal_attempt(confidence: float = 0.95, name: str = "ASUS RTX 3070"):
     return ClassificationAttempt(
-        AIClassification(True, name, "normal", confidence, False, "working complete GPU", "standalone"),
+        AIClassification(
+            True, name, "normal", confidence, False, "working complete GPU", "standalone",
+            "active", True, True, "sale", False, False, 320_000, 320_000,
+            "marketplace", confidence, True,
+        ),
         0.25,
         None,
     )
@@ -58,21 +62,23 @@ class AiPipelineTests(unittest.TestCase):
 
     def test_high_confidence_normal_result_is_canonically_accepted(self):
         stats = AiScanStats()
-        result = self.processor(FakeClassifier(normal_attempt()), stats)(listing())
+        result = self.processor(FakeClassifier(normal_attempt()), stats)(
+            listing(title="ASUS RTX 3070", description="정상 작동")
+        )
         self.assertFalse(result.ai_reject)
         self.assertEqual(result.condition_status, "normal")
         self.assertEqual(result.ai_normalized_product_name, "RTX 3070")
         self.assertEqual(stats.accepted_normal, 1)
         self.assertEqual(stats.classified_listings, [result])
 
-    def test_clear_standalone_part_passes_without_ai(self):
+    def test_clear_standalone_part_still_passes_through_ai(self):
         classifier = FakeClassifier(normal_attempt())
         clear = replace(listing(), title="ASUS RTX 3070", description="정상 작동")
         result = self.processor(classifier)(clear)
         self.assertFalse(result.ai_reject)
         self.assertTrue(result.ai_usable_for_market_price)
         self.assertEqual(result.ai_normalized_product_name, "RTX 3070")
-        self.assertEqual(classifier.calls, 0)
+        self.assertEqual(classifier.calls, 1)
 
     def test_ai_must_mark_an_ambiguous_listing_usable_and_active(self):
         rejected = ClassificationAttempt(
@@ -102,13 +108,79 @@ class AiPipelineTests(unittest.TestCase):
         self.assertTrue(result.ai_reject)
         self.assertEqual(result.ai_scope, "bundle")
 
-    def test_broken_and_non_part_listings_are_rejected_without_ai(self):
+    def test_pricing_bait_and_ambiguous_description_price_never_become_market_evidence(self):
+        accepted = normal_attempt().classification
+        assert accepted is not None
+        cases = (
+            replace(accepted, price_bait=True, displayed_price=1, effective_price=320_000),
+            replace(
+                accepted, price_source="description", effective_price=None,
+                usable_price=False, usable_for_market_price=False,
+            ),
+        )
+        for index, classification in enumerate(cases):
+            with self.subTest(classification=classification):
+                result = self.processor(
+                    FakeClassifier(ClassificationAttempt(classification, 0.01, None))
+                )(listing(str(index)))
+                self.assertTrue(result.ai_reject)
+                self.assertFalse(result.ai_usable_for_market_price)
+                self.assertFalse(result.ai_usable_price)
+                self.assertIsNone(result.effective_price)
+
+    def test_ai_price_semantics_drive_numbered_multi_item_and_edge_case_eligibility(self):
+        """Application consumes factual AI semantics; it does not parse listing prices itself."""
+        factual = normal_attempt().classification
+        assert factual is not None
+        cases = {
+            "numbered exact target maps to one price": (
+                replace(factual, price_bait=False, hidden_price_condition=False,
+                        usable_price=True, effective_price=320_000, price_source="description"),
+                True,
+            ),
+            "ambiguous multiple prices": (
+                replace(factual, hidden_price_condition=True, usable_price=False, effective_price=None),
+                False,
+            ),
+            "deposit": (
+                replace(factual, price_bait=True, hidden_price_condition=True,
+                        usable_price=False, effective_price=None),
+                False,
+            ),
+            "placeholder attention price": (
+                replace(factual, price_bait=True, usable_price=False, effective_price=None),
+                False,
+            ),
+            "description explicitly replaces displayed price": (
+                replace(factual, price_bait=True, usable_price=True, effective_price=400_000,
+                        price_source="description"),
+                False,
+            ),
+            "bundle": (
+                replace(factual, scope="bundle", usable_price=False, effective_price=None),
+                False,
+            ),
+            "negotiable no fixed amount": (
+                replace(factual, hidden_price_condition=True, usable_price=False, effective_price=None),
+                False,
+            ),
+        }
+        for label, (classification, expected_eligible) in cases.items():
+            with self.subTest(label=label):
+                result = self.processor(
+                    FakeClassifier(ClassificationAttempt(classification, 0.01, None))
+                )(listing(label, title="ASUS RTX 3070", description="정상 작동"))
+                self.assertEqual(not result.ai_reject, expected_eligible)
+                self.assertEqual(result.ai_usable_price, expected_eligible)
+                self.assertEqual(result.effective_price, 320_000 if expected_eligible else None)
+
+    def test_broken_and_non_part_listings_are_rejected_after_ai(self):
         classifier = FakeClassifier(normal_attempt())
         broken = self.processor(classifier)(listing(condition_status="broken"))
         unrelated = self.processor(classifier)(listing("2", title="아이패드", description="정상 작동"))
         self.assertTrue(broken.ai_reject)
         self.assertTrue(unrelated.ai_reject)
-        self.assertEqual(classifier.calls, 0)
+        self.assertEqual(classifier.calls, 2)
 
     def test_canonical_normalization_failure_becomes_unknown(self):
         result = self.processor(FakeClassifier(normal_attempt(name="Mystery Card X")))(listing())
@@ -201,7 +273,8 @@ class AiPipelineTests(unittest.TestCase):
             "SELECT sale_status, usable_for_market_price FROM ai_classifications "
             "ORDER BY id LIMIT 1"
         ).fetchone()
-        self.assertEqual(tuple(row), ("active", 1))
+        # AI rows retain factual results only; application eligibility is derived later.
+        self.assertEqual(tuple(row), ("active", 0))
 
     def test_timeout_subprocess_and_unavailable_model_fail_closed(self):
         for error in ("timeout", "subprocess failure", "model unavailable"):

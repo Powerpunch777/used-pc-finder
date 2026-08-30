@@ -43,7 +43,11 @@ class FakeClassifier:
             "wrong": ("standalone", "Ryzen 5 5600"),
         }[value.product_id]
         return ClassificationAttempt(
-            AIClassification(True, name, "normal", 0.99, False, scope, scope), 0.01, None
+            AIClassification(
+                True, name, "normal", 0.99, scope != "standalone", scope, scope,
+                "active", scope == "standalone", scope == "standalone", "sale", False,
+                False, value.price, value.price, "marketplace", 0.99, scope == "standalone",
+            ), 0.01, None
         )
 
 
@@ -101,4 +105,3 @@ class BackfillTests(unittest.TestCase):
                 self.database, FakeCrawler([]), "Ryzen 5 5600", self.settings,
                 sample_size=30, classifier=FakeClassifier(),
             )
-

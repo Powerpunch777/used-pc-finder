@@ -23,13 +23,20 @@ def listing() -> Listing:
 def valid_result() -> dict[str, object]:
     return {
         "normalized_product_name": "RTX 4070 SUPER",
+        "exact_product": True,
         "condition": "normal",
         "sale_status": "active",
         "confidence": 0.98,
-        "usable_for_market_price": True,
-        "reject": False,
         "reason": "Complete, working graphics card.",
         "scope": "standalone",
+        "model_mismatch": False,
+        "price_bait": False,
+        "hidden_price_condition": False,
+        "displayed_price": 500000,
+        "effective_price": 500000,
+        "price_source": "marketplace",
+        "price_confidence": 0.98,
+        "usable_price": True,
     }
 
 

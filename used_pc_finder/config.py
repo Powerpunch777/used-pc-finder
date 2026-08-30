@@ -79,6 +79,8 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
             raise ValueError("Bunjang max_pages must be at least 1")
         if int(source.get("watermark_overlap_pages", 1)) < 1:
             raise ValueError("Bunjang watermark_overlap_pages must be at least 1")
+        if "pricing_identity" in source and not isinstance(source["pricing_identity"], bool):
+            raise ValueError("Bunjang pricing_identity must be a boolean when specified")
     ai_settings = settings.get("ai_classification", {"enabled": False})
     if not isinstance(ai_settings, dict):
         raise ValueError("ai_classification must be an object")
@@ -104,8 +106,27 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict[str, Any]:
             raise ValueError("AI classification confidence_threshold must be from 0 to 1")
         if int(ai_settings["ai_concurrency"]) < 1:
             raise ValueError("AI classification ai_concurrency must be positive")
+        if float(ai_settings.get("recovery_timeout_seconds", 900)) <= 0:
+            raise ValueError("AI classification recovery_timeout_seconds must be positive")
         if float(ai_settings.get("progress_interval_seconds", 10)) <= 0:
             raise ValueError("AI classification progress_interval_seconds must be positive")
+    final_review = settings.get("final_email_review", {"enabled": False})
+    if not isinstance(final_review, dict):
+        raise ValueError("final_email_review must be an object")
+    if final_review.get("enabled", False):
+        required_final_review = {
+            "command", "model", "reasoning_effort", "timeout_seconds",
+            "confidence_threshold", "schema_path",
+        }
+        missing_final_review = required_final_review.difference(final_review)
+        if missing_final_review:
+            raise ValueError(
+                "final_email_review missing: " + ", ".join(sorted(missing_final_review))
+            )
+        if float(final_review["timeout_seconds"]) <= 0:
+            raise ValueError("final_email_review timeout_seconds must be positive")
+        if not 0 <= float(final_review["confidence_threshold"]) <= 1:
+            raise ValueError("final_email_review confidence_threshold must be from 0 to 1")
     email_settings = settings.get("email_notifications", {"enabled": False})
     if not isinstance(email_settings, dict):
         raise ValueError("email_notifications must be an object")

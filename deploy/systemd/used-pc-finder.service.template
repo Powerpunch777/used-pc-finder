@@ -1,0 +1,21 @@
+[Unit]
+Description=Used PC Finder incremental Bunjang scan
+Wants=network-online.target
+After=network-online.target
+# Timer activations must continue even after repeated transient scan failures.
+StartLimitIntervalSec=0
+ConditionPathExists=@PROJECT_ROOT@/main.py
+
+[Service]
+Type=oneshot
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+# RuntimeDirectory is created for every run; flock also protects manual starts.
+RuntimeDirectory=used-pc-finder
+RuntimeDirectoryMode=0750
+Environment=USED_PC_FINDER_LOCK_FILE=/run/used-pc-finder/scan.lock
+ExecStart=@PROJECT_ROOT@/scripts/run-production-scan.sh
+Nice=10
+IOSchedulingClass=best-effort

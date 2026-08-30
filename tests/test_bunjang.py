@@ -26,7 +26,8 @@ def candidate(product_id: str, updated_at: str, price: int = 500_000) -> Listing
         search_fingerprint="same-search-content",
         ai_is_computer_part=True,
         ai_normalized_product_name="RTX 4070 SUPER",
-        ai_scope="standalone",
+        ai_scope="standalone", ai_sale_status="active",
+        ai_usable_for_market_price=True, ai_usable_price=True, effective_price=price,
     )
 
 
@@ -256,6 +257,28 @@ class BunjangScanTests(unittest.TestCase):
         self.assertEqual(result.detail_requests, 1)
         self.assertEqual(self.database.count(), 1)
 
+    def test_incomplete_detail_is_persisted_fail_closed_without_first_stage_ai(self):
+        item = candidate("missing-detail", "2026-08-28T10:00:00+09:00")
+
+        class IncompleteCrawler(FakeCrawler):
+            def inspect(self, listing):
+                self.detail_requests += 1
+                return replace(listing, description="")
+
+        calls = 0
+
+        def process(_listing):
+            nonlocal calls
+            calls += 1
+            return _listing
+
+        result = self.scan(IncompleteCrawler({"first": BunjangPage([item], None, True)}), process=process)
+        self.assertEqual(calls, 0)
+        self.assertEqual(result.price_observations_recorded, 0)
+        stored = self.database.listing_by_product_id("bunjang", "missing-detail")
+        self.assertIsNotNone(stored)
+        self.assertTrue(stored.ai_reject)
+
     def test_failed_search_is_logged_and_skipped_without_stopping_the_scan(self):
         class FailingSearchCrawler(FakeCrawler):
             def search_page(self, query, source_key, cursor=None):
@@ -350,7 +373,11 @@ class BunjangScanTests(unittest.TestCase):
             def classify_attempt(self, _listing):
                 self.calls += 1
                 return ClassificationAttempt(
-                    AIClassification(True, "RTX 4070 SUPER", "normal", 0.99, False, "working", "standalone"),
+                    AIClassification(
+                        True, "RTX 4070 SUPER", "normal", 0.99, False, "working", "standalone",
+                        "active", True, True, "sale", False, False, _listing.price,
+                        _listing.price, "marketplace", 0.99, True,
+                    ),
                     0.01,
                     None,
                 )

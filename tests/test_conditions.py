@@ -22,7 +22,8 @@ class ConditionTests(unittest.TestCase):
             "local",
             description=description,
             condition_status=status,
-            ai_scope="standalone",
+            ai_scope="standalone", ai_is_computer_part=True,
+            ai_normalized_product_name="RTX 4070 SUPER", ai_sale_status="active",
         )
 
         self.assertEqual(status, "broken")
@@ -39,7 +40,9 @@ class ConditionTests(unittest.TestCase):
             "local",
             description=description,
             condition_status=status,
-            ai_scope="standalone",
+            ai_scope="standalone", ai_is_computer_part=True,
+            ai_normalized_product_name="RTX 4070 SUPER", ai_sale_status="active",
+            ai_usable_for_market_price=True, ai_usable_price=True, effective_price=500000,
         )
 
         deals = find_deals([listing], self.market_prices, 10)

@@ -2,7 +2,11 @@ from datetime import UTC, datetime, timedelta
 import unittest
 
 from used_pc_finder.database import ListingDatabase
-from used_pc_finder.market_estimator import PriceObservation, estimate_market_price
+from used_pc_finder.market_estimator import (
+    PriceObservation,
+    estimate_market_price,
+    estimation_observations,
+)
 from used_pc_finder.models import Listing
 
 
@@ -47,7 +51,8 @@ class MarketEstimatorTests(unittest.TestCase):
                 "RTX 3070", 500_000, "https://example/1", "", "bunjang_search",
                 "bunjang:1", "정상 작동", "normal", marketplace="bunjang",
                 product_id="1", updated_at="2026-06-01T00:00:00Z",
-                ai_scope="standalone",
+                ai_scope="standalone", ai_usable_for_market_price=True,
+                ai_usable_price=True, effective_price=500_000,
             )
             self.assertTrue(database.add(old))
             database.record_price_observation(
@@ -57,7 +62,8 @@ class MarketEstimatorTests(unittest.TestCase):
                 "RTX 3070", 350_000, "https://example/1", "", "bunjang_search",
                 "bunjang:1", "정상 작동", "normal", marketplace="bunjang",
                 product_id="1", updated_at="2026-08-28T00:00:00Z",
-                ai_scope="standalone",
+                ai_scope="standalone", ai_usable_for_market_price=True,
+                ai_usable_price=True, effective_price=350_000,
             )
             state = database.candidate_state(reduced)
             database.store_processed(reduced, state)
@@ -100,6 +106,12 @@ class MarketEstimatorTests(unittest.TestCase):
         self.assertFalse(estimate.automatic)
         self.assertEqual(estimate.estimator, "manual_fallback")
         self.assertEqual(estimate.price, 420_000)
+
+    def test_zero_mad_does_not_drop_non_modal_genuine_observations(self):
+        values = [observation(170_000, 1, str(number)) for number in range(5)]
+        values.append(observation(150_000, 1, "other"))
+        used = estimation_observations(values, now=NOW, window_days=90)
+        self.assertEqual(len(used), 6)
 
 
 if __name__ == "__main__":

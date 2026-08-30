@@ -17,7 +17,7 @@ LOGGER = logging.getLogger(__name__)
 _STATUSES = frozenset({"normal", "risky", "broken", "unknown"})
 _SALE_STATUSES = frozenset({"active", "reserved", "sold", "unavailable", "unknown"})
 _SCOPES = frozenset({"standalone", "bundle", "complete_pc", "accessory", "unknown"})
-CLASSIFIER_VERSION = "codex-cli-listing-v3"
+CLASSIFIER_VERSION = "codex-cli-listing-v6-pricing-semantics"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,11 +28,23 @@ class AIClassification:
     normalized_product_name: str | None
     condition_status: str
     confidence: float
+    # Legacy storage compatibility only. These are derived by application code,
+    # never requested from or trusted as an AI decision.
     reject: bool
     reason: str
     scope: str = "unknown"
     sale_status: str = "active"
     usable_for_market_price: bool = True
+    exact_product: bool = False
+    listing_intent: str = "unknown"
+    model_mismatch: bool = False
+    price_bait: bool = False
+    displayed_price: int | None = None
+    effective_price: int | None = None
+    price_source: str = "unknown"
+    price_confidence: float = 0.0
+    usable_price: bool = False
+    hidden_price_condition: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,15 +60,25 @@ Do not use tools, commands, web access, browser automation, files, or external
 knowledge lookup. Do not browse any marketplace. Return only the JSON required by the
 provided schema.
 
-Decide whether this listing can be used as one market-price observation. Reject
-accessory-only, box-only, parts-only, repair-needed, incomplete, untested,
-unrelated, sold, unavailable, model-mismatched, and uncertain listings. Use
-condition normal, risky, broken, or unknown. Use sale_status active, reserved,
-sold, unavailable, or unknown. Set usable_for_market_price true only when the
-listing is active, normal, a standalone complete part, has a clear canonical
-identity, and you are highly confident. Set reject true for every other listing.
-For normalized_product_name, return a concise canonical product model suitable for
-price matching (for example, \"RTX 4070 SUPER\"), or null if uncertain.
+Classify identity, scope, condition, sale status, and pricing together.
+For normalized_product_name return a concise canonical model or null. exact_product
+is true only when the exact model is clearly stated. model_mismatch is true for any
+conflict between the offered item and its claimed model.
+
+Interpret pricing from the title, full description, displayed marketplace price, and
+metadata together. Set price_bait true only for a clearly deceptive or placeholder
+price: contact-only/attention price, deposit, deliberately incorrect displayed price,
+or description text explicitly replacing the marketplace price. Do not set price_bait
+true merely because a listing has multiple products, numbered items, or multiple
+prices. For multiple items, map the exact target to its one-to-one price when the text
+does so unambiguously (for example, “980 PRO 2TB No. 2: 340,000 KRW”); then set
+usable_price true and effective_price to that amount even if other items are offered.
+Set hidden_price_condition true and usable_price false only when the target price is
+actually ambiguous, conditional, negotiable without a fixed amount, bundle-dependent,
+or cannot be reliably mapped to the exact target. Set displayed_price to the fetched
+marketplace price and effective_price only when that target-specific amount is known.
+price_source must be marketplace, description, both, or unknown. Do not decide whether
+to email or reject a listing; return factual verification only.
 
 Classify scope from title and description: standalone only for one sellable computer
 part by itself; bundle for CPU+motherboard/RAM or other multi-part or ambiguous
@@ -70,6 +92,9 @@ Listing description: {listing.description}
 Listing price (KRW): {listing.price}
 Listing location: {listing.location}
 Listing source: {listing.source_type}
+Listing marketplace: {listing.marketplace}
+Listing product id: {listing.product_id or "unknown"}
+Listing public status: {listing.listing_status}
 """
 
 
@@ -170,30 +195,39 @@ class CodexCliClassifier:
 
 
 def _parse_result(raw: Any) -> AIClassification:
-    if not isinstance(raw, dict) or set(raw) != {
-        "normalized_product_name",
-        "condition",
-        "confidence",
-        "reject",
-        "reason",
-        "scope",
-        "sale_status",
-        "usable_for_market_price",
-    }:
+    expected = {
+        "normalized_product_name", "exact_product", "condition", "confidence",
+        "reason", "scope", "sale_status",
+        "model_mismatch", "price_bait", "displayed_price", "effective_price",
+        "price_source", "price_confidence", "usable_price", "hidden_price_condition",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected:
         raise ValueError("classification does not match the required keys")
     normalized = raw["normalized_product_name"]
     confidence = raw["confidence"]
+    price_confidence = raw["price_confidence"]
+    displayed_price = raw["displayed_price"]
+    effective_price = raw["effective_price"]
     if (
         not (isinstance(normalized, str) or normalized is None)
+        or not isinstance(raw["exact_product"], bool)
         or raw["condition"] not in _STATUSES
         or isinstance(confidence, bool)
         or not isinstance(confidence, (int, float))
         or not 0 <= confidence <= 1
-        or not isinstance(raw["reject"], bool)
         or not isinstance(raw["reason"], str)
         or raw["scope"] not in _SCOPES
         or raw["sale_status"] not in _SALE_STATUSES
-        or not isinstance(raw["usable_for_market_price"], bool)
+        or not isinstance(raw["model_mismatch"], bool)
+        or not isinstance(raw["price_bait"], bool)
+        or isinstance(displayed_price, bool) or not isinstance(displayed_price, int) or displayed_price <= 0
+        or not (isinstance(effective_price, int) or effective_price is None)
+        or isinstance(effective_price, bool)
+        or (effective_price is not None and effective_price <= 0)
+        or raw["price_source"] not in {"marketplace", "description", "both", "unknown"}
+        or isinstance(price_confidence, bool) or not isinstance(price_confidence, (int, float)) or not 0 <= price_confidence <= 1
+        or not isinstance(raw["usable_price"], bool)
+        or not isinstance(raw["hidden_price_condition"], bool)
     ):
         raise ValueError("classification has invalid field values")
     return AIClassification(
@@ -201,9 +235,12 @@ def _parse_result(raw: Any) -> AIClassification:
         normalized.strip() if isinstance(normalized, str) else None,
         raw["condition"],
         float(confidence),
-        raw["reject"],
+        False,
         raw["reason"].strip(),
         raw["scope"],
         raw["sale_status"],
-        raw["usable_for_market_price"],
+        False,
+        raw["exact_product"], "unknown", raw["model_mismatch"],
+        raw["price_bait"], displayed_price, effective_price, raw["price_source"],
+        float(price_confidence), raw["usable_price"], raw["hidden_price_condition"],
     )

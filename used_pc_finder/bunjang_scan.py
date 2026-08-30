@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .bunjang import BunjangCrawler, BunjangRequestError
 from .database import CandidateState, ListingDatabase
@@ -12,6 +12,20 @@ from .models import Listing
 from .pricing import comparable_product_name
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _reliable_detail_content(listing: Listing) -> bool:
+    """Do not send partial/error detail payloads to the first-stage AI."""
+    return bool(listing.title.strip() and listing.description.strip() and listing.price > 0)
+
+
+def _unreliable_detail_listing(listing: Listing) -> Listing:
+    return replace(
+        listing, condition_status="unknown", ai_is_computer_part=False,
+        ai_reject=True, ai_reason="Bunjang detail content was incomplete or unreliable",
+        ai_scope="unknown", ai_sale_status="unknown", ai_usable_for_market_price=False,
+        ai_usable_price=False, effective_price=None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +112,11 @@ def scan_bunjang_source(
             else:
                 page_has_new_or_changed = True
                 try:
-                    processed = process_listing(crawler.inspect(candidate))
+                    detailed = crawler.inspect(candidate)
+                    processed = (
+                        process_listing(detailed) if _reliable_detail_content(detailed)
+                        else _unreliable_detail_listing(detailed)
+                    )
                     database.store_processed(processed, state)
                     normalized_name = comparable_product_name(processed, require_ai=True)
                     should_observe = (

@@ -2,7 +2,7 @@
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -27,6 +27,7 @@ from .config import (
 from .bunjang import BunjangCrawler, detail_error_diagnostics
 from .bunjang_scan import scan_bunjang_source
 from .database import ListingDatabase
+from .final_review import CodexTextFinalReviewer, FinalEmailReviewGate
 from .market_estimator import (
     MarketPriceEstimate,
     PriceObservation,
@@ -38,8 +39,11 @@ from .notifications import EmailNotifier, send_unnotified_deal_digest
 from .pre_ai_filter import cheap_listing_scope, cheap_rejection_reason
 from .pre_ai_filter import deterministic_standalone_name
 from .pricing import comparable_product_name, discount_percent, find_deals
-from .parser import normalize_product_name
+from .parser import exact_model_match, is_computer_part, is_pricing_identity, normalize_product_name
 from .secrets import load_smtp_password, setup_smtp_password
+from .backup import backup_database
+from .status import format_production_status, production_status
+from .anomaly import assess_scan_anomalies
 
 
 @dataclass(slots=True)
@@ -118,6 +122,21 @@ class SaleStatusTrackingResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BacklogNotificationResult:
+    total_unnotified: int
+    detail_checked: int
+    passed: int
+    emailed: int
+    email_attempted: bool
+    email_success: bool
+    rejected: dict[str, int]
+    first_stage_ai_calls: int
+    first_stage_ai_cache_hits: int
+    first_stage_ai_failures: int
+    final_review_calls: int
+
+
+@dataclass(frozen=True, slots=True)
 class FullBackfillResult:
     listings_inspected: int
     valid_observations_collected: int
@@ -126,6 +145,20 @@ class FullBackfillResult:
     incomplete_queries: int
     ai_calls: int
     ai_failures: int
+    max_concurrency_observed: int
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class MarketPriceRepairResult:
+    listings_reviewed: int
+    deterministic_accepts: int
+    deterministic_rejects: int
+    ai_calls: int
+    ai_failures: int
+    ai_cache_hits: int
+    observations_rebuilt: int
+    history_rows_rebuilt: int
     max_concurrency_observed: int
     elapsed_seconds: float
 
@@ -223,7 +256,8 @@ class BackfillProgressReporter:
 def format_deal(deal: Deal) -> str:
     item = deal.listing
     return (
-        f"{deal.normalized_name} | {item.price:,} KRW | "
+        f"{deal.normalized_name} | displayed {item.price:,} KRW | "
+        f"effective {(deal.effective_price or item.price):,} KRW | "
         f"reference {deal.reference_price:,} KRW | "
         f"{deal.discount_percent:.1f}% cheaper | {item.source_type} | "
         f"{item.location} | {item.url}"
@@ -287,11 +321,17 @@ def format_ai_listing_audit(
             f"reference_source={source} | reference_price=- | discount_percent=- | "
             "final_decision=no_reference_price"
         )
-    discount = (estimate.price - listing.price) / estimate.price * 100.0
+    effective_price = listing.effective_price
+    if effective_price is None:
+        return (
+            f"AI_LISTING | product_id={listing.product_id or '-'} | title={listing.title} | "
+            "effective_price=- | final_decision=rejected"
+        )
+    discount = (estimate.price - effective_price) / estimate.price * 100.0
     decision = "bargain" if discount >= minimum_discount_percent else "below_discount_threshold"
     return (
         f"AI_LISTING | product_id={listing.product_id or '-'} | title={listing.title} | "
-        f"price={listing.price:,} KRW | normalized={normalized_name} | "
+        f"displayed_price={listing.price:,} KRW | effective_price={effective_price:,} KRW | normalized={normalized_name} | "
         f"condition={listing.condition_status} | confidence={(listing.ai_confidence or 0.0):.2f} | "
         f"reference_source={source} | reference_price={estimate.price:,} KRW | "
         f"discount_percent={discount:.1f} | final_decision={decision}"
@@ -355,6 +395,10 @@ def sample_deals() -> list[Deal]:
         ai_normalized_product_name="RTX 4070 SUPER",
         ai_confidence=1.0,
         ai_scope="standalone",
+        ai_sale_status="active",
+        ai_usable_for_market_price=True,
+        ai_usable_price=True,
+        effective_price=520_000,
     )
     return find_deals(
         [sample], load_market_prices(), settings["minimum_discount_percent"]
@@ -377,16 +421,20 @@ def test_email_deals(
         normalized_name = comparable_product_name(listing, require_ai=True)
         if normalized_name is None or normalized_name not in manual_prices:
             continue
+        effective_price = listing.effective_price
+        if effective_price is None:
+            continue
         reference_price = max(
-            listing.price + 1,
-            int(listing.price * qualifying_reference_multiplier) + 1,
+            effective_price + 1,
+            int(effective_price * qualifying_reference_multiplier) + 1,
         )
         deals.append(
             Deal(
                 listing,
                 normalized_name,
                 reference_price,
-                discount_percent(listing.price, reference_price),
+                discount_percent(effective_price, reference_price),
+                effective_price,
             )
         )
         if len(deals) == 2:
@@ -399,22 +447,9 @@ def classify_new_listing(
     classifier: CodexCliClassifier | None,
     ai_settings: dict[str, object],
 ) -> Listing:
-    """Apply cheap rules first, then fail-closed AI classification to a new listing."""
-    rejection_reason = cheap_rejection_reason(listing)
-    if rejection_reason:
-        return replace(
-            listing,
-            ai_is_computer_part=False,
-            ai_confidence=0.0,
-            ai_reject=True,
-            ai_reason=rejection_reason,
-            ai_scope=cheap_listing_scope(listing) or listing.ai_scope,
-        )
-    deterministic_name = deterministic_standalone_name(listing)
-    if deterministic_name:
-        return _deterministic_accept(listing, deterministic_name)
+    """Fail closed unless first-stage AI classifies fetched listing content."""
     if classifier is None:
-        return _failed_ai_listing(listing, "AI review is unavailable for an ambiguous listing")
+        return _failed_ai_listing(listing, "First-stage AI classification is unavailable")
     if hasattr(classifier, "classify_attempt"):
         attempt = classifier.classify_attempt(listing)
         result = attempt.classification
@@ -432,27 +467,49 @@ def _apply_ai_classification(
     result: AIClassification,
     ai_settings: dict[str, object],
 ) -> Listing:
-    minimum_confidence = float(
-        ai_settings.get("confidence_threshold", ai_settings.get("minimum_confidence", 0.85))
+    minimum_confidence = max(
+        0.90,
+        float(ai_settings.get("confidence_threshold", ai_settings.get("minimum_confidence", 0.90))),
     )
     canonical_name = (
         normalize_product_name(result.normalized_product_name)
         if result.normalized_product_name
         else None
     )
+    model_matches_listing = bool(
+        canonical_name and exact_model_match(canonical_name, listing.title, listing.description)
+    )
     reject = (
-        result.reject
-        or not result.is_computer_part
+        not result.is_computer_part
         or result.scope != "standalone"
         or result.condition_status != "normal"
         or result.confidence < minimum_confidence
         or not canonical_name
+        or not model_matches_listing
+        or not is_pricing_identity(canonical_name)
         or result.sale_status != "active"
-        or not result.usable_for_market_price
+        or not result.exact_product
+        or result.model_mismatch
+        or result.price_bait
+        or result.hidden_price_condition
+        or not result.usable_price
+        or result.effective_price is None
+        or result.effective_price <= 0
+        or result.displayed_price != listing.price
     )
     reason = result.reason
     if result.normalized_product_name and not canonical_name:
         reason = f"AI normalized product cannot be canonicalized: {result.normalized_product_name}"
+    elif canonical_name and not model_matches_listing:
+        reason = "AI normalized product is not evidenced by exact listing text"
+    elif canonical_name and not is_pricing_identity(canonical_name):
+        reason = "discovery bucket is not a coherent pricing identity"
+    elif result.displayed_price != listing.price:
+        reason = "AI displayed price does not match fetched marketplace price"
+    elif result.price_bait:
+        reason = "AI identified a placeholder, bait, or otherwise misleading price"
+    elif result.hidden_price_condition:
+        reason = "AI identified an unresolved hidden pricing condition"
     final_status = result.condition_status
     if result.confidence < minimum_confidence or not canonical_name:
         final_status = "unknown"
@@ -466,7 +523,9 @@ def _apply_ai_classification(
         ai_reason=reason,
         ai_scope=result.scope,
         ai_sale_status=result.sale_status,
-        ai_usable_for_market_price=result.usable_for_market_price and not reject,
+        ai_usable_for_market_price=not reject,
+        effective_price=result.effective_price if not reject else None,
+        ai_usable_price=result.usable_price and not reject,
     )
 
 
@@ -478,11 +537,13 @@ def _deterministic_accept(listing: Listing, normalized_name: str) -> Listing:
         ai_is_computer_part=True,
         ai_normalized_product_name=normalized_name,
         ai_confidence=1.0,
-        ai_reject=False,
-        ai_reason="rule-based clear active standalone part",
+        ai_reject=not is_pricing_identity(normalized_name),
+        ai_reason=("rule-based clear active standalone part"
+                   if is_pricing_identity(normalized_name)
+                   else "discovery bucket is not a coherent pricing identity"),
         ai_scope="standalone",
         ai_sale_status="active",
-        ai_usable_for_market_price=True,
+        ai_usable_for_market_price=is_pricing_identity(normalized_name),
     )
 
 
@@ -500,7 +561,7 @@ def _failed_ai_listing(listing: Listing, reason: str) -> Listing:
 
 
 class AiListingProcessor:
-    """Apply deterministic gates and cache reuse before AI queueing."""
+    """Queue every fetched new/changed detail for first-stage AI or reuse its cache."""
 
     def __init__(
         self,
@@ -515,27 +576,9 @@ class AiListingProcessor:
         self.stats = stats
 
     def prepare(self, candidate: Listing) -> Listing | QueuedAiClassification:
-        """Return a final cheap/cached result or enqueue an uncached CLI task."""
-        rejection_reason = cheap_rejection_reason(candidate)
-        if rejection_reason:
-            self.stats.deterministic_rejects += 1
-            return replace(
-                candidate,
-                ai_is_computer_part=False,
-                ai_confidence=0.0,
-                ai_reject=True,
-                ai_reason=rejection_reason,
-                ai_scope=cheap_listing_scope(candidate) or candidate.ai_scope,
-                ai_sale_status=candidate.listing_status,
-                ai_usable_for_market_price=False,
-            )
-        if deterministic_name := deterministic_standalone_name(candidate):
-            classified = _deterministic_accept(candidate, deterministic_name)
-            self.stats.accepted_normal += 1
-            self.stats.classified_listings.append(classified)
-            return classified
+        """Every fetched new/changed detail gets AI or a cached AI result."""
         if self.classifier is None:
-            return _failed_ai_listing(candidate, "AI review is unavailable for an ambiguous listing")
+            return _failed_ai_listing(candidate, "First-stage AI classification is unavailable")
         self.stats.candidates += 1
         fingerprint = classification_fingerprint(candidate)
         cached = self.database.cached_ai_classification(
@@ -548,7 +591,9 @@ class AiListingProcessor:
         if cached is not None:
             self.stats.cached += 1
             classified = _apply_ai_classification(candidate, cached, self.ai_settings)
+            self.database.finish_ai_review(classified)
         else:
+            self.database.enqueue_ai_review(candidate, fingerprint)
             return QueuedAiClassification(self, candidate)
         if (
             classified.ai_is_computer_part
@@ -582,9 +627,11 @@ class AiListingProcessor:
         if attempt.classification is None:
             self.stats.failures += 1
             failed = _failed_ai_listing(candidate, attempt.error or "Codex CLI classification failed")
+            self.database.finish_ai_review(failed, error=attempt.error or "Codex CLI classification failed")
             self.stats.classified_listings.append(failed)
             return failed
         classified = _apply_ai_classification(candidate, attempt.classification, self.ai_settings)
+        self.database.finish_ai_review(classified)
         if (
             classified.ai_is_computer_part
             and not classified.ai_reject
@@ -781,6 +828,24 @@ def build_ai_classifier(settings: dict[str, object]) -> CodexCliClassifier | Non
     )
 
 
+def build_final_email_reviewer(
+    settings: dict[str, object],
+) -> CodexTextFinalReviewer | None:
+    """Build the independent text-only final email-review client."""
+    if not settings.get("enabled", False):
+        return None
+    schema_path = Path(str(settings["schema_path"]))
+    if not schema_path.is_absolute():
+        schema_path = PROJECT_ROOT / schema_path
+    return CodexTextFinalReviewer(
+        schema_path,
+        command=str(settings["command"]),
+        model=str(settings["model"]),
+        reasoning_effort=str(settings["reasoning_effort"]),
+        timeout_seconds=float(settings["timeout_seconds"]),
+    )
+
+
 def backfill_market_price(
     database: ListingDatabase,
     crawler: BunjangCrawler,
@@ -967,6 +1032,173 @@ def track_sale_statuses(
             failures += 1
     return SaleStatusTrackingResult(
         len(candidates), checked, sold_transitions, failures, time.monotonic() - started
+    )
+
+
+def _backlog_stored_candidate(listing: Listing, minimum_confidence: float) -> bool:
+    """Cheap, conservative prefilter before rechecking current Bunjang detail."""
+    return (
+        listing.listing_status == "active"
+        and listing.ai_scope == "standalone"
+        and listing.condition_status == "normal"
+        and listing.ai_is_computer_part is True
+        and not listing.ai_reject
+        and listing.ai_usable_for_market_price
+        and listing.ai_usable_price
+        and listing.effective_price is not None
+        and (listing.ai_confidence or 0.0) >= minimum_confidence
+        and listing.ai_normalized_product_name is not None
+    )
+
+
+def _backlog_first_stage_rejection(listing: Listing, minimum_confidence: float) -> str | None:
+    """Classify only major fail-closed gates for the operator summary."""
+    if listing.listing_status != "active" or listing.ai_sale_status != "active":
+        return "current_not_active"
+    if (listing.ai_confidence or 0.0) < minimum_confidence:
+        return "low_first_stage_confidence"
+    if listing.ai_scope != "standalone":
+        return "non_standalone"
+    if listing.condition_status != "normal":
+        return "abnormal_or_condition"
+    if not listing.ai_normalized_product_name or not exact_model_match(
+        listing.ai_normalized_product_name, listing.title, listing.description
+    ):
+        return "model_mismatched"
+    if not listing.ai_usable_price or listing.effective_price is None:
+        return "ambiguous_price"
+    if listing.ai_reject or listing.ai_is_computer_part is not True or not listing.ai_usable_for_market_price:
+        return "first_stage_rejected"
+    return None
+
+
+def run_backlog_notification_pass(
+    database: ListingDatabase,
+    crawler: BunjangCrawler,
+    settings: dict[str, object],
+    classifier: CodexCliClassifier | None,
+    reviewer: CodexTextFinalReviewer | None,
+) -> BacklogNotificationResult:
+    """Send at most one current-detail, text-only digest for stored Bunjang bargains.
+
+    This is intentionally not a market-price backfill: it never inserts,
+    updates, invalidates, or rebuilds market observations or their history.
+    """
+    all_listings = database.backlog_notification_listings()
+    rejected: Counter[str] = Counter()
+    minimum_discount = float(settings["minimum_discount_percent"])
+    ai_settings = dict(settings.get("ai_classification", {}))
+    minimum_confidence = float(ai_settings.get("confidence_threshold", 0.9))
+    manual_prices = load_market_prices()
+
+    # The persisted first-stage decision is only a cost-saving prefilter.  Every
+    # surviving candidate is refetched and reclassified/cached from its current text.
+    stored_candidates: list[Listing] = []
+    for listing in all_listings:
+        if not _backlog_stored_candidate(listing, minimum_confidence):
+            rejected["stored_first_stage_ineligible"] += 1
+            continue
+        name = listing.ai_normalized_product_name
+        assert name is not None
+        estimate = market_price_estimate(database, name, manual_prices, settings)
+        if estimate.price is None:
+            rejected["no_trusted_reference_price"] += 1
+            continue
+        if discount_percent(listing.effective_price or listing.price, estimate.price) < minimum_discount:
+            rejected["stored_below_discount_threshold"] += 1
+            continue
+        stored_candidates.append(listing)
+
+    ai_stats = AiScanStats()
+    processor = AiListingProcessor(database, classifier, ai_settings, ai_stats)
+    refreshed_active: list[Listing] = []
+    detail_checked = 0
+    for stored in stored_candidates:
+        try:
+            current = crawler.inspect(stored)
+            detail_checked += 1
+        except Exception:
+            rejected["current_detail_request_failed"] += 1
+            continue
+        # A sale-status/condition change is useful operational state, so preserve
+        # it.  This method deliberately leaves notification and price evidence alone.
+        if current.listing_status != "active":
+            database.store_backlog_listing(current)
+            rejected["current_not_active"] += 1
+            continue
+        refreshed_active.append(current)
+
+    preliminary_deals: list[Deal] = []
+    pricing_sources: dict[str, str] = {}
+
+    def record_classified(classified: Listing) -> None:
+        database.store_backlog_listing(classified)
+        gate = _backlog_first_stage_rejection(classified, minimum_confidence)
+        if gate is not None:
+            rejected[gate] += 1
+            return
+        name = comparable_product_name(classified, require_ai=True)
+        if name is None or classified.effective_price is None:
+            rejected["first_stage_rejected"] += 1
+            return
+        estimate = market_price_estimate(database, name, manual_prices, settings)
+        if estimate.price is None:
+            rejected["no_trusted_reference_price"] += 1
+            return
+        discount = discount_percent(classified.effective_price, estimate.price)
+        if discount < minimum_discount:
+            rejected["below_discount_threshold"] += 1
+            return
+        preliminary_deals.append(
+            Deal(classified, name, estimate.price, discount, classified.effective_price)
+        )
+        pricing_sources[name] = "automatic" if estimate.automatic else "manual"
+
+    queued: list[QueuedAiClassification] = []
+    for current in refreshed_active:
+        prepared = processor.prepare(current)
+        if isinstance(prepared, QueuedAiClassification):
+            queued.append(prepared)
+        else:
+            record_classified(prepared)
+    run_ai_worker_pool(
+        queued, int(ai_settings.get("ai_concurrency", 1)),
+        lambda _work, classified: record_classified(classified),
+    )
+
+    final_passed: list[Deal] = []
+    review_metadata: dict[str, dict[str, object]] = {}
+    final_review_calls = 0
+    if preliminary_deals and reviewer is not None:
+        final_gate = FinalEmailReviewGate(database, crawler, reviewer, dict(settings["final_email_review"]))
+        summary = final_gate.review_deals(
+            preliminary_deals, minimum_discount_percent=minimum_discount
+        )
+        final_review_calls = reviewer.calls
+        final_passed = list(summary.passed_deals)
+        for decision in summary.decisions:
+            if not decision.passed:
+                rejected[f"final_review_{decision.status}"] += 1
+        for deal in final_passed:
+            if deal.listing.product_id:
+                review_metadata[deal.listing.product_id] = database.final_email_review_metadata(deal.listing)
+    elif preliminary_deals:
+        rejected["final_review_unavailable"] += len(preliminary_deals)
+
+    # The notifier sends exactly one digest and only marks the included entries
+    # after SMTP accepts it.  It also rechecks notified_at immediately before send.
+    email_attempted = bool(final_passed)
+    emailed = send_unnotified_deal_digest(
+        final_passed, database, dict(settings["email_notifications"]), pricing_sources,
+        review_metadata=review_metadata,
+    )
+    return BacklogNotificationResult(
+        total_unnotified=len(all_listings), detail_checked=detail_checked,
+        passed=len(final_passed), emailed=emailed, email_attempted=email_attempted,
+        email_success=(not email_attempted or emailed == len(final_passed)),
+        rejected=dict(sorted(rejected.items())), first_stage_ai_calls=ai_stats.calls,
+        first_stage_ai_cache_hits=ai_stats.cached, first_stage_ai_failures=ai_stats.failures,
+        final_review_calls=final_review_calls,
     )
 
 
@@ -1278,11 +1510,229 @@ def run_full_market_price_backfill(
     )
 
 
+def _repair_deterministic_reject(listing: Listing, reason: str, scope: str = "unknown") -> Listing:
+    return replace(
+        listing, ai_is_computer_part=False, ai_confidence=1.0, ai_reject=True,
+        ai_reason=reason, ai_scope=scope, ai_sale_status=listing.listing_status,
+        ai_usable_for_market_price=False,
+    )
+
+
+def _prepare_market_price_repair_listing(
+    listing: Listing,
+    condition_rules: dict[str, list[str]],
+    processor: AiListingProcessor,
+) -> tuple[str, Listing | QueuedAiClassification]:
+    """Classify stored text offline, routing only unresolved cases to AI."""
+    condition = classify_condition(listing.title, listing.description, condition_rules)
+    candidate = replace(listing, condition_status=condition, ai_scope="unknown")
+    if candidate.listing_status != "active":
+        return "reject", _repair_deterministic_reject(
+            candidate, f"rule-based listing status is {candidate.listing_status}"
+        )
+    if scope := cheap_listing_scope(candidate):
+        return "reject", _repair_deterministic_reject(
+            candidate, f"rule-based listing scope is {scope}", scope
+        )
+    if condition in {"broken", "risky"}:
+        return "reject", _repair_deterministic_reject(
+            candidate, f"rule-based condition status is {condition}"
+        )
+    text_name = normalize_product_name(candidate.title) or normalize_product_name(
+        candidate.description
+    )
+    if not is_computer_part(f"{candidate.title}\n{candidate.description}"):
+        return "reject", _repair_deterministic_reject(
+            candidate, "rule-based computer-part match missing"
+        )
+    if text_name is None:
+        return "reject", _repair_deterministic_reject(
+            candidate, "rule-based supported exact model match missing"
+        )
+    if not is_pricing_identity(text_name):
+        return "reject", _repair_deterministic_reject(
+            candidate, "discovery bucket is not a coherent pricing identity"
+        )
+    # A clear exact-model, normal listing is no longer ambiguous just because
+    # a previous pass stored unknown scope/condition.  Everything else with an
+    # unknown field is sent to AI so the repair can recover false rejections.
+    if condition == "normal" and (name := deterministic_standalone_name(candidate)):
+        return "accept", _deterministic_accept(candidate, name)
+    needs_ai_review = (
+        condition == "unknown"
+        or listing.condition_status == "unknown"
+        or listing.ai_scope == "unknown"
+    )
+
+    # Unknown condition/scope records are precisely the cases that need a fresh
+    # content review.  The processor's normal-condition gate is intentionally
+    # bypassed here; the AI receives the original text and must fail closed.
+    review_candidate = replace(candidate, condition_status="normal")
+    if needs_ai_review and processor.classifier is not None:
+        fingerprint = classification_fingerprint(review_candidate)
+        cached = processor.database.cached_ai_classification(
+            review_candidate, fingerprint, model=processor.classifier.model,
+            reasoning_effort=processor.classifier.reasoning_effort,
+            classifier_version=CLASSIFIER_VERSION,
+        )
+        if cached is not None:
+            processor.stats.cached += 1
+            prepared = _apply_ai_classification(review_candidate, cached, processor.ai_settings)
+        else:
+            return "ai", QueuedAiClassification(processor, review_candidate)
+    else:
+        prepared = processor.prepare(review_candidate)
+    if isinstance(prepared, Listing):
+        return ("accept" if not prepared.ai_reject else "reject"), prepared
+    return "ai", prepared
+
+
+def repair_market_price_database(
+    database: ListingDatabase,
+    settings: dict[str, object],
+    classifier: CodexCliClassifier | None,
+    *,
+    progress: Callable[[str], None] = print,
+    repair_key: str = "offline-market-price-repair-v4",
+) -> MarketPriceRepairResult:
+    """Repair completed backfill data without any crawler or notification use."""
+    started = time.monotonic()
+    checkpoint = database.market_price_repair_checkpoint(repair_key)
+    after_id = int(checkpoint["last_listing_id"]) if checkpoint else 0
+    reviewed = int(checkpoint["listings_reviewed"]) if checkpoint else 0
+    accepted = int(checkpoint["deterministic_accepts"]) if checkpoint else 0
+    rejected = int(checkpoint["deterministic_rejects"]) if checkpoint else 0
+    ai_calls = int(checkpoint["ai_calls"]) if checkpoint else 0
+    ai_failures = int(checkpoint["ai_failures"]) if checkpoint else 0
+    repaired_observations = int(checkpoint["observations_rebuilt"]) if checkpoint else 0
+    all_candidates = database.market_price_repair_candidates()
+    pending = [(row_id, listing) for row_id, listing in all_candidates if row_id > after_id]
+    total = reviewed + len(pending)
+    rules = load_condition_rules()
+    ai_settings = dict(settings.get("ai_classification", {"enabled": False}))
+    # This repair deliberately retains the requested bounded concurrency even
+    # if someone later raises the scan setting.
+    concurrency = 4
+    cache_hits = 0
+    max_concurrency = 0
+    last_report = 0.0
+
+    def report(stage: str, telemetry: AiPoolTelemetry | None = None, force: bool = False) -> None:
+        nonlocal last_report
+        now = time.monotonic()
+        if not force and now - last_report < float(ai_settings.get("progress_interval_seconds", 10)):
+            return
+        last_report = now
+        done = reviewed
+        elapsed = now - started
+        rate = done / elapsed if elapsed else 0.0
+        eta = (total - done) / rate if rate else None
+        pool = telemetry or AiPoolTelemetry()
+        progress(
+            f"REPAIR_LIVE | stage={stage} | reviewed={done}/{total} | "
+            f"deterministic_accepts={accepted} | deterministic_rejects={rejected} | "
+            f"ai_calls={ai_calls + pool.completed_calls} | ai_failures={ai_failures + pool.failures} | "
+            f"ai_queue_size={pool.queue_length} | active_ai_workers={pool.active_workers} | "
+            f"concurrency={concurrency} | elapsed_seconds={elapsed:.1f} | "
+            f"estimated_remaining_seconds={eta:.1f}" if eta is not None else
+            f"REPAIR_LIVE | stage={stage} | reviewed={done}/{total} | "
+            f"deterministic_accepts={accepted} | deterministic_rejects={rejected} | "
+            f"ai_calls={ai_calls + pool.completed_calls} | ai_failures={ai_failures + pool.failures} | "
+            f"ai_queue_size={pool.queue_length} | active_ai_workers={pool.active_workers} | "
+            f"concurrency={concurrency} | elapsed_seconds={elapsed:.1f} | estimated_remaining_seconds=calculating"
+        )
+
+    report("starting", force=True)
+    batch_size = 100
+    for start_index in range(0, len(pending), batch_size):
+        batch = pending[start_index:start_index + batch_size]
+        stats = AiScanStats()
+        processor = AiListingProcessor(database, classifier, ai_settings, stats)
+        queued: list[tuple[int, QueuedAiClassification]] = []
+        for row_id, listing in batch:
+            outcome, prepared = _prepare_market_price_repair_listing(listing, rules, processor)
+            if outcome == "ai":
+                assert isinstance(prepared, QueuedAiClassification)
+                queued.append((row_id, prepared))
+                continue
+            assert isinstance(prepared, Listing)
+            database.store_market_price_repair_listing(row_id, prepared)
+            if outcome == "accept":
+                accepted += 1
+            else:
+                rejected += 1
+
+        queued_ids = {work.listing.product_id: row_id for row_id, work in queued}
+
+        def save_ai(_work: QueuedAiClassification, classified: Listing) -> None:
+            nonlocal accepted, rejected
+            assert classified.product_id is not None
+            database.store_market_price_repair_listing(queued_ids[classified.product_id], classified)
+            if classified.ai_reject:
+                rejected += 1
+            else:
+                accepted += 1
+
+        telemetry = run_ai_worker_pool(
+            [work for _row_id, work in queued], concurrency, save_ai,
+            lambda pool: report("ai_review", pool),
+        )
+        ai_calls += telemetry.completed_calls
+        ai_failures += telemetry.failures
+        cache_hits += stats.cached
+        max_concurrency = max(max_concurrency, telemetry.max_concurrency_observed)
+        reviewed += len(batch)
+        after_id = batch[-1][0]
+        database.update_market_price_repair_checkpoint(
+            repair_key, last_listing_id=after_id, listings_reviewed=reviewed,
+            deterministic_accepts=accepted, deterministic_rejects=rejected,
+            ai_calls=ai_calls, ai_failures=ai_failures,
+            observations_rebuilt=repaired_observations, completed=False,
+        )
+        report("classifying", force=True)
+
+    # Only rebuild derived observations after every source record has a repaired
+    # classification.  This makes interruption during review safe and resumable.
+    database.begin_market_price_observation_rebuild()
+    rebuilt = 0
+    for _row_id, listing in database.market_price_repair_candidates():
+        name = listing.ai_normalized_product_name
+        qualifies = (
+            name is not None and is_pricing_identity(name)
+            and listing.listing_status == "active" and listing.condition_status == "normal"
+            and listing.ai_scope == "standalone" and listing.ai_is_computer_part is True
+            and not listing.ai_reject and listing.ai_usable_for_market_price
+            and (listing.ai_confidence or 0.0) >= float(ai_settings["confidence_threshold"])
+            and exact_model_match(name, listing.title, listing.description)
+        )
+        if qualifies and database.rebuild_market_price_observation(listing, name):
+            rebuilt += 1
+    history_rows = database.finish_market_price_observation_rebuild()
+    repaired_observations = rebuilt
+    database.update_market_price_repair_checkpoint(
+        repair_key, last_listing_id=after_id, listings_reviewed=reviewed,
+        deterministic_accepts=accepted, deterministic_rejects=rejected,
+        ai_calls=ai_calls, ai_failures=ai_failures,
+        observations_rebuilt=rebuilt, completed=True,
+    )
+    report("complete", force=True)
+    return MarketPriceRepairResult(
+        reviewed, accepted, rejected, ai_calls, ai_failures, cache_hits, rebuilt,
+        history_rows, max_concurrency, time.monotonic() - started,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--sample", action="store_true", help="run the local sample")
     mode.add_argument("--live", action="store_true", help="scan configured Bunjang sources")
+    mode.add_argument("--status", action="store_true", help="show read-only production health status")
+    mode.add_argument("--backup-database", action="store_true", help="run the daily integrity-checked SQLite backup")
+    mode.add_argument(
+        "--backlog-notify", action="store_true",
+        help="one locked, current-detail digest pass over never-notified stored Bunjang bargains",
+    )
     mode.add_argument(
         "--track-sale-status", action="store_true",
         help="recheck only due stored active standalone listings; never sends email",
@@ -1295,7 +1745,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-market-price-backfill", action="store_true",
         help="resume every configured market-price query through its cursor end; never sends email",
     )
+    mode.add_argument(
+        "--repair-market-price-data", action="store_true",
+        help="offline reclassification and derived-price repair of persisted backfill data; no crawl or email",
+    )
     mode.add_argument("--market-price", metavar="PRODUCT", help="show one product's market-price estimate")
+    mode.add_argument(
+        "--dry-run-final-review", metavar="PRODUCT_ID",
+        help="refresh and text-review one stored Bunjang bargain without sending email",
+    )
     mode.add_argument("--setup-email", action="store_true", help="save Gmail app password with hidden input")
     mode.add_argument("--test-email", action="store_true", help="send one bargain-format SMTP test email")
     parser.add_argument("--limit", type=int, default=10, help="maximum candidates per Bunjang query")
@@ -1318,7 +1776,96 @@ def main(argv: Sequence[str] | None = None) -> int:
         setup_smtp_password()
         load_smtp_password()
         return 0
+    if args.status:
+        with ListingDatabase(DEFAULT_DATABASE_PATH) as database:
+            database.initialize()
+            print(format_production_status(production_status(database)))
+        return 0
+    if args.backup_database:
+        target = backup_database(DEFAULT_DATABASE_PATH, PROJECT_ROOT / "data" / "backups")
+        print(f"BACKUP | status={'created' if target else 'already_current'} | path={target or '-'}")
+        return 0
+    if args.repair_market_price_data:
+        settings = load_settings()
+        classifier = build_ai_classifier(settings.get("ai_classification", {"enabled": False}))
+        with ListingDatabase(DEFAULT_DATABASE_PATH) as database:
+            database.initialize()
+            result = repair_market_price_database(database, settings, classifier)
+        print(
+            f"REPAIR_FINAL | reviewed={result.listings_reviewed} | "
+            f"deterministic_accepts={result.deterministic_accepts} | "
+            f"deterministic_rejects={result.deterministic_rejects} | "
+            f"ai_calls={result.ai_calls} | ai_failures={result.ai_failures} | "
+            f"ai_cache_hits={result.ai_cache_hits} | observations_rebuilt={result.observations_rebuilt} | "
+            f"history_rows_rebuilt={result.history_rows_rebuilt} | "
+            f"max_concurrency_observed={result.max_concurrency_observed} | "
+            f"elapsed_seconds={result.elapsed_seconds:.3f}"
+        )
+        return 0
+    if args.dry_run_final_review:
+        settings = load_settings()
+        final_settings = settings.get("final_email_review", {"enabled": False})
+        reviewer = build_final_email_reviewer(final_settings)
+        if reviewer is None:
+            raise RuntimeError("final_email_review must be enabled for a dry run")
+        crawler = BunjangCrawler(
+            settings["request_delay_seconds"], settings.get("request_timeout_seconds", 10),
+            settings.get("user_agent", "used_pc_finder/0.1"), maximum_listing_price=None,
+        )
+        with ListingDatabase(DEFAULT_DATABASE_PATH) as database:
+            database.initialize()
+            listing = database.listing_by_product_id("bunjang", args.dry_run_final_review)
+            if listing is None or not listing.ai_normalized_product_name:
+                raise RuntimeError("stored classified Bunjang listing was not found")
+            estimate = market_price_estimate(
+                database, listing.ai_normalized_product_name, load_market_prices(), settings
+            )
+            if estimate.price is None:
+                raise RuntimeError("stored listing has no current reference market price")
+            deal = Deal(
+                listing, listing.ai_normalized_product_name, estimate.price,
+                discount_percent(listing.effective_price or listing.price, estimate.price),
+                listing.effective_price or listing.price,
+            )
+            gate = FinalEmailReviewGate(database, crawler, reviewer, final_settings)
+            decision = gate.review_deal(
+                deal, minimum_discount_percent=float(settings["minimum_discount_percent"])
+            )
+        print(
+            f"FINAL_REVIEW_DRY_RUN | product_id={args.dry_run_final_review} | "
+            f"passed={decision.passed} | status={decision.status} | cached={decision.cached} | "
+            f"text_only=true | reason={decision.reason}"
+        )
+        return 0
     load_smtp_password()
+    if args.backlog_notify:
+        settings = load_settings()
+        crawler = BunjangCrawler(
+            settings["request_delay_seconds"],
+            settings.get("request_timeout_seconds", 10),
+            settings.get("user_agent", "used_pc_finder/0.1"),
+            maximum_listing_price=None,
+        )
+        classifier = build_ai_classifier(settings.get("ai_classification", {"enabled": False}))
+        reviewer = build_final_email_reviewer(settings.get("final_email_review", {"enabled": False}))
+        with ListingDatabase(DEFAULT_DATABASE_PATH) as database:
+            database.initialize()
+            result = run_backlog_notification_pass(
+                database, crawler, settings, classifier, reviewer
+            )
+        rejected = ",".join(
+            f"{reason}={count}" for reason, count in result.rejected.items()
+        ) or "none"
+        print(
+            f"BACKLOG_NOTIFICATION | total_unnotified={result.total_unnotified} | "
+            f"detail_checked={result.detail_checked} | passed={result.passed} | "
+            f"emailed={result.emailed} | email_attempted={result.email_attempted} | "
+            f"email_success={result.email_success} | first_stage_ai_calls={result.first_stage_ai_calls} | "
+            f"first_stage_ai_cache_hits={result.first_stage_ai_cache_hits} | "
+            f"first_stage_ai_failures={result.first_stage_ai_failures} | "
+            f"final_review_calls={result.final_review_calls} | rejected={rejected}"
+        )
+        return 0
     if args.test_email:
         settings = load_settings()
         notifier = EmailNotifier.from_settings(settings["email_notifications"])
@@ -1377,7 +1924,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             target_names = {
                 name for source in settings["bunjang_sources"]
-                if (name := normalize_product_name(str(source["query"]))) is not None
+                if source.get("pricing_identity", True)
+                and (name := normalize_product_name(str(source["query"]))) is not None
+                and is_pricing_identity(name)
             }
             estimates = [
                 market_price_estimate(database, name, load_market_prices(), settings)
@@ -1429,6 +1978,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         listings: list[Listing] = []
         with ListingDatabase(DEFAULT_DATABASE_PATH) as database:
             database.initialize()
+            recovered_ai_jobs = database.recover_stale_ai_reviews(
+                float(ai_settings.get("recovery_timeout_seconds", 900))
+            )
             seen_product_ids: set[str] = set()
             scan_results = []
             scan_stats = []
@@ -1469,16 +2021,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                         work.listing.product_id == item.product_id for work in queued_ai
                     ):
                         queued_locations[item.product_id] = (result_index, listing_index)
+            retry_ai_stats = AiScanStats()
+            retry_processor = AiListingProcessor(database, classifier, ai_settings, retry_ai_stats)
+            retry_listings: list[Listing] = []
+            queued_ids = {work.listing.product_id for work in queued_ai if work.listing.product_id}
+            for pending_listing in database.ready_ai_review_listings():
+                if pending_listing.product_id in queued_ids:
+                    continue
+                prepared = retry_processor.prepare(pending_listing)
+                if isinstance(prepared, QueuedAiClassification):
+                    queued_ai.append(prepared)
+                    queued_ids.add(pending_listing.product_id)
+                else:
+                    database.store_processed(prepared, database.candidate_state(prepared))
+                    retry_listings.append(prepared)
+            queued_ai = [
+                work for work in queued_ai
+                if database.mark_ai_review_processing(work.listing)
+            ]
             observation_additions = [0 for _result in scan_results]
+            retry_observation_additions = 0
+            first_stage_started = time.monotonic()
+            first_stage_last_reported = 0.0
 
             def save_completed_ai(work: QueuedAiClassification, classified: Listing) -> None:
+                nonlocal retry_observation_additions
                 if not classified.product_id:
                     return
-                result_index, listing_index = queued_locations[classified.product_id]
-                result = scan_results[result_index]
-                original_state = result.processed_states[classified.product_id]
+                location = queued_locations.get(classified.product_id)
+                original_state = (
+                    scan_results[location[0]].processed_states[classified.product_id]
+                    if location is not None else database.candidate_state(classified)
+                )
                 database.store_processed(classified, database.candidate_state(classified))
-                result.listings[listing_index] = classified
+                if location is not None:
+                    result_index, listing_index = location
+                    result = scan_results[result_index]
+                    result.listings[listing_index] = classified
+                else:
+                    retry_listings.append(classified)
                 normalized_name = comparable_product_name(classified, require_ai=True)
                 should_observe = (
                     normalized_name is not None
@@ -1491,14 +2072,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 )
                 if should_observe and database.record_price_observation(classified, normalized_name):
-                    observation_additions[result_index] += 1
+                    if location is not None:
+                        observation_additions[location[0]] += 1
+                    else:
+                        retry_observation_additions += 1
+
+            def report_first_stage_progress(telemetry: AiPoolTelemetry) -> None:
+                """Expose queue state and a conservative ETA during mandatory AI review."""
+                nonlocal first_stage_last_reported
+                now = time.monotonic()
+                interval = float(ai_settings.get("progress_interval_seconds", 10))
+                if telemetry.completed_calls < telemetry.initial_queue_length and (
+                    telemetry.completed_calls == 0 or now - first_stage_last_reported < interval
+                ):
+                    return
+                first_stage_last_reported = now
+                average = (
+                    telemetry.subprocess_execution_seconds / telemetry.completed_calls
+                    if telemetry.completed_calls else None
+                )
+                pending = telemetry.queue_length + telemetry.active_workers
+                eta = (pending / int(ai_settings["ai_concurrency"])) * average if average is not None else None
+                print(
+                    f"FIRST_STAGE_AI_PROGRESS | completed={telemetry.completed_calls}/"
+                    f"{telemetry.initial_queue_length} | queued={telemetry.queue_length} | "
+                    f"active_workers={telemetry.active_workers} | failures={telemetry.failures} | "
+                    f"elapsed_seconds={now - first_stage_started:.1f} | "
+                    f"estimated_remaining_seconds={eta:.1f}" if eta is not None else
+                    f"FIRST_STAGE_AI_PROGRESS | completed={telemetry.completed_calls}/"
+                    f"{telemetry.initial_queue_length} | queued={telemetry.queue_length} | "
+                    f"active_workers={telemetry.active_workers} | failures={telemetry.failures} | "
+                    f"elapsed_seconds={now - first_stage_started:.1f} | estimated_remaining_seconds=calculating"
+                )
 
             pool_telemetry = run_ai_worker_pool(
                 queued_ai,
                 int(ai_settings["ai_concurrency"]),
                 save_completed_ai,
+                report_first_stage_progress,
             )
-            pool_telemetry.cache_hits = sum(item.cached for item in scan_stats)
+            pool_telemetry.cache_hits = sum(item.cached for item in scan_stats) + retry_ai_stats.cached
             scan_results = [
                 replace(
                     result,
@@ -1508,7 +2121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 for index, result in enumerate(scan_results)
             ]
-            listings = [item for result in scan_results for item in result.listings]
+            listings = [item for result in scan_results for item in result.listings] + retry_listings
             for source, result, ai_stats in zip(sources, scan_results, scan_stats, strict=True):
                 pricing_candidates = sum(
                     comparable_product_name(item, require_ai=classifier is not None) is not None
@@ -1585,6 +2198,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"bunjang_permanent_failures={crawler.permanent_failures} | "
                 f"bunjang_failed_requests={crawler.request_failures}"
             )
+            queue_counts = database.ai_review_queue_counts()
+            print(
+                f"AI_QUEUE | recovered_stale={recovered_ai_jobs} | pending={queue_counts['pending']} | "
+                f"processing={queue_counts['processing']} | retry={queue_counts['retry']} | "
+                f"completed={queue_counts['completed']} | retry_observations={retry_observation_additions}"
+            )
             for task in pool_telemetry.task_timings:
                 print(
                     f"AI_TASK | product_id={task.product_id or '-'} | started_at={task.started_at} | "
@@ -1594,14 +2213,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             email_settings = settings.get("email_notifications", {"enabled": False})
             if args.no_email:
                 email_settings = dict(email_settings, enabled=False)
+            final_review_settings = settings.get("final_email_review", {"enabled": False})
+            final_reviewer = build_final_email_reviewer(final_review_settings)
+            final_reviewed_deals: list[Deal] = []
+            if final_reviewer is not None:
+                final_gate = FinalEmailReviewGate(
+                    database, crawler, final_reviewer, final_review_settings
+                )
+                final_summary = final_gate.review_deals(
+                    deals,
+                    minimum_discount_percent=float(settings["minimum_discount_percent"]),
+                )
+                final_reviewed_deals = list(final_summary.passed_deals)
+                for decision in final_summary.decisions:
+                    print(
+                        f"FINAL_REVIEW | product_id={decision.deal.listing.product_id or '-'} | "
+                        f"passed={decision.passed} | status={decision.status} | "
+                        f"cached={decision.cached} | text_only=true | "
+                        f"reason={decision.reason}"
+                    )
+            price_changes = [
+                (item.price - state.previous_price) / state.previous_price * 100.0
+                for result in scan_results for item in result.listings
+                if item.product_id and (state := result.processed_states.get(item.product_id))
+                and state.previous_price not in (None, 0)
+            ]
+            anomaly = assess_scan_anomalies(
+                price_change_percents=price_changes,
+                search_records=sum(item.search_records_fetched for item in scan_results),
+                valid_observations=sum(item.price_observations_recorded for item in scan_results) + retry_observation_additions,
+                prior_valid_observations=0,
+                ai_candidates=sum(item.candidates for item in scan_stats) + retry_ai_stats.candidates,
+                ai_failures=sum(item.failures for item in scan_stats) + retry_ai_stats.failures,
+            )
+            if anomaly.price_warnings:
+                print(f"PRICE_WARNING | large_moves={anomaly.price_warnings} | safety_halt=false")
+            if anomaly.safety_halt:
+                print("SAFETY_HALT | notification_suppressed=true | reasons=" + ",".join(anomaly.reasons))
+                final_reviewed_deals = []
             simulated_notifications = sum(
-                not database.was_notified(deal.listing) for deal in deals
+                not database.was_notified(deal.listing) for deal in final_reviewed_deals
             )
             sent = send_unnotified_deal_digest(
-                deals, database, email_settings, pricing_sources
+                final_reviewed_deals, database, email_settings, pricing_sources
             )
             if sent:
                 print(f"EMAIL | Sent one digest containing {sent} deal(s)")
+            database.record_pipeline_run(
+                status="success", search_records=sum(item.search_records_fetched for item in scan_results),
+                valid_observations=sum(item.price_observations_recorded for item in scan_results) + retry_observation_additions,
+                ai_candidates=sum(item.candidates for item in scan_stats) + retry_ai_stats.candidates,
+                ai_failures=sum(item.failures for item in scan_stats) + retry_ai_stats.failures,
+                safety_halt=anomaly.safety_halt,
+                detail=",".join(anomaly.reasons),
+            )
             total_ai_calls = sum(item.calls for item in scan_stats)
             total_ai_seconds = sum(item.execution_seconds for item in scan_stats)
             total_pricing_candidates = sum(

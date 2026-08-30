@@ -31,6 +31,10 @@ class Listing:
     last_active_at: str | None = None
     first_sold_seen_at: str | None = None
     last_active_price: int | None = None
+    # The marketplace-displayed price remains ``price``.  AI may extract a
+    # different effective price only when it is unambiguous for this exact part.
+    effective_price: int | None = None
+    ai_usable_price: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,3 +43,4 @@ class Deal:
     normalized_name: str
     reference_price: int
     discount_percent: float
+    effective_price: int | None = None

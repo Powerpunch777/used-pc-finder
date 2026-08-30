@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["exact_product", "normalized_product_name", "scope", "condition", "sale_status", "model_mismatch", "displayed_price", "effective_price", "price_bait", "hidden_price_condition", "usable_price", "price_confidence", "confidence", "reason"],
+  "properties": {
+    "exact_product": {"type": "boolean"},
+    "normalized_product_name": {"type": ["string", "null"]},
+    "scope": {"type": "string", "enum": ["standalone", "bundle", "complete_pc", "accessory", "unknown"]},
+    "condition": {"type": "string", "enum": ["normal", "risky", "broken", "unknown"]},
+    "sale_status": {"type": "string", "enum": ["active", "reserved", "sold", "unavailable", "unknown"]},
+    "model_mismatch": {"type": "boolean"},
+    "displayed_price": {"type": "integer", "minimum": 1},
+    "effective_price": {"type": ["integer", "null"], "minimum": 1},
+    "price_bait": {"type": "boolean"},
+    "hidden_price_condition": {"type": "boolean"},
+    "usable_price": {"type": "boolean"},
+    "price_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "reason": {"type": "string"}
+  }
+}
