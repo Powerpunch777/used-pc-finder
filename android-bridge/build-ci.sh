@@ -10,7 +10,7 @@ test -f "$bridge_platform"
 for command in aapt d8 zipalign apksigner;do test -x "$bridge_tools/$command";done
 mkdir -p "$bridge_work/classes" "$bridge_work/generated" "$bridge_work/dex" "$bridge_out"
 "$bridge_tools/aapt" package -f -m -M android-bridge/AndroidManifest.xml -S android-bridge/res -I "$bridge_platform" -J "$bridge_work/generated" -F "$bridge_work/resources.apk"
-javac -encoding UTF-8 -source 8 -target 8 -bootclasspath "$bridge_platform" -d "$bridge_work/classes" android-bridge/src/local/usedpc/bridge/*.java "$bridge_work/generated/local/usedpc/bridge/R.java"
+javac -encoding UTF-8 --release 8 -classpath "$bridge_platform" -d "$bridge_work/classes" android-bridge/src/local/usedpc/bridge/*.java "$bridge_work/generated/local/usedpc/bridge/R.java"
 jar cf "$bridge_work/classes.jar" -C "$bridge_work/classes" .
 "$bridge_tools/d8" --min-api 26 --lib "$bridge_platform" --output "$bridge_work/dex" "$bridge_work/classes.jar"
 cp "$bridge_work/resources.apk" "$bridge_work/unsigned.apk"
