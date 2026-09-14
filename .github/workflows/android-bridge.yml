@@ -26,9 +26,32 @@ jobs:
       - name: Select installed Java and Android SDK
         shell: bash
         run: |
-          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
-          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
-          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          set -euo pipefail
+          if [ -n "${JAVA_HOME_17_X64:-}" ]; then
+            export JAVA_HOME="$JAVA_HOME_17_X64"
+          elif command -v javac >/dev/null; then
+            export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends openjdk-17-jdk-headless unzip zip
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          fi
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          bridge_sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          bridge_manager="$bridge_sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$bridge_manager" ]; then
+            bridge_sdk="$RUNNER_TEMP/android-sdk"
+            mkdir -p "$bridge_sdk/cmdline-tools"
+            curl -fL --retry 3 -o "$RUNNER_TEMP/android-commandline.zip" https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+            unzip -q "$RUNNER_TEMP/android-commandline.zip" -d "$bridge_sdk/cmdline-tools"
+            mv "$bridge_sdk/cmdline-tools/cmdline-tools" "$bridge_sdk/cmdline-tools/latest"
+            bridge_manager="$bridge_sdk/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "ANDROID_SDK_ROOT=$bridge_sdk" >> "$GITHUB_ENV"
+          { yes || true; } | "$bridge_manager" --sdk_root="$bridge_sdk" --licenses >/dev/null
+          "$bridge_manager" --sdk_root="$bridge_sdk" 'platforms;android-35' 'build-tools;35.0.0'
       - name: Compile unsigned diagnostic APK
         shell: bash
         run: bash android-bridge/build-ci.sh
