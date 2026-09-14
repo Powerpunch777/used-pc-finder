@@ -1,0 +1,6 @@
+/artifacts/
+*.apk
+*.p12
+*.jks
+*.pem
+*.key
