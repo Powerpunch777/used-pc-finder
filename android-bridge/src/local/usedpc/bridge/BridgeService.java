@@ -105,7 +105,7 @@ public class BridgeService extends AccessibilityService {
                 // No arbitrary intent, shell, Javascript, text input or app switching.
                 if(!kind.equals("tap")&&!kind.equals("refresh")&&!kind.equals("back")){output[0]=result("unsupported");return;}
                 if(!frame.optString("status").equals("ready")||!frame.optString("hash").equals(cmd.optString("screen_hash"))||
-                    lastRead<=0||now-lastRead>6000){output[0]=result("screen_changed");return;}
+                    lastRead<=0||System.currentTimeMillis()-lastRead>6000){output[0]=result("screen_changed");return;}
                 // Persist reservation BEFORE dispatch. Process death never retries it.
                 JSONObject entry=new JSONObject().put("hash",commandHash);
                 if(!prefs.edit().putString("command."+id,entry.toString()).commit()){output[0]=result("journal_failed");return;}
@@ -157,6 +157,7 @@ public class BridgeService extends AccessibilityService {
         edit.putString("journal",list.append(keep).toString()).commit();
     }
     private JSONObject readScreen()throws Exception{
+        long readStarted=System.currentTimeMillis();
         PowerManager power=(PowerManager)getSystemService(POWER_SERVICE);
         KeyguardManager lock=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);
         if(!power.isInteractive()||lock.isKeyguardLocked())return result("locked");
@@ -181,7 +182,8 @@ public class BridgeService extends AccessibilityService {
             }node.recycle();
         }
         while(!queue.isEmpty())queue.removeFirst().recycle();
-        lastRead=System.currentTimeMillis();lastHash=sha(screen.toString());
+        if(System.currentTimeMillis()-readStarted>6000)return result("read_slow");
+        lastRead=readStarted;lastHash=sha(screen.toString());
         return result("ready").put("screen",screen).put("hash",lastHash).put("read_at",lastRead);
     }
     private JSONObject post(String path,JSONObject body)throws Exception{
