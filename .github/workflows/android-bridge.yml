@@ -52,13 +52,13 @@ jobs:
           echo "ANDROID_SDK_ROOT=$bridge_sdk" >> "$GITHUB_ENV"
           { yes || true; } | "$bridge_manager" --sdk_root="$bridge_sdk" --licenses >/dev/null
           "$bridge_manager" --sdk_root="$bridge_sdk" 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Compile unsigned diagnostic APK
+      - name: Compile unsigned six-tap APK
         shell: bash
         run: bash android-bridge/build-ci.sh
       - name: Keep APK and verification metadata
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bunjang-bridge-0.1-unsigned
+          name: bunjang-bridge-0.2-unsigned
           path: android-bridge/artifacts/
           if-no-files-found: error
           retention-days: 7

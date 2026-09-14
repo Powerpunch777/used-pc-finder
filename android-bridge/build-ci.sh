@@ -15,12 +15,12 @@ jar cf "$bridge_work/classes.jar" -C "$bridge_work/classes" .
 "$bridge_tools/d8" --min-api 26 --lib "$bridge_platform" --output "$bridge_work/dex" "$bridge_work/classes.jar"
 cp "$bridge_work/resources.apk" "$bridge_work/unsigned.apk"
 (cd "$bridge_work/dex" && zip -q "$bridge_work/unsigned.apk" classes.dex)
-"$bridge_tools/zipalign" -f -p 4 "$bridge_work/unsigned.apk" "$bridge_out/bunjang-bridge-0.1-unsigned.apk"
+"$bridge_tools/zipalign" -f -p 4 "$bridge_work/unsigned.apk" "$bridge_out/bunjang-bridge-0.2-unsigned.apk"
 # Build the official signing CLI for the phone's existing Android runtime.
 # This keeps the persistent signing key on the phone and avoids a local JDK.
 "$bridge_tools/d8" --min-api 26 --lib "$bridge_platform" --output "$bridge_out/apksigner-android.zip" "$bridge_tools/lib/apksigner.jar"
 # Deliberately unsigned: the phone signs with a persistent PRIVATE key, never
 # uploaded to GitHub, put in a workflow secret, log or artifact.
-"$bridge_tools/aapt" dump badging "$bridge_out/bunjang-bridge-0.1-unsigned.apk" > "$bridge_out/package-info.txt"
-(cd "$bridge_out" && sha256sum bunjang-bridge-0.1-unsigned.apk apksigner-android.zip > SHA256SUMS)
+"$bridge_tools/aapt" dump badging "$bridge_out/bunjang-bridge-0.2-unsigned.apk" > "$bridge_out/package-info.txt"
+(cd "$bridge_out" && sha256sum bunjang-bridge-0.2-unsigned.apk apksigner-android.zip > SHA256SUMS)
 printf 'Built from %s\n' "${GITHUB_SHA:-local}" > "$bridge_out/source-commit.txt"

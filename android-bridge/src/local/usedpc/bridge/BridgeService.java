@@ -61,7 +61,8 @@ public class BridgeService extends AccessibilityService {
     private void loop(long run){
         int failures=0;
         while(active(run))try{
-            JSONObject request=new JSONObject().put("version",1).put("device","note9");
+            JSONObject request=new JSONObject().put("version",1).put("device","note9")
+                .put("app_version",2).put("max_tap_points",Math.min(6,GestureDescription.getMaxStrokeCount()));
             JSONObject reply=post("/v1/poll",request);
             if(!active(run))break;
             if(reply.optBoolean("pairing")){message="서버 승인 대기 — 코드 "+pairCode;Thread.sleep(2000);continue;}
@@ -76,7 +77,8 @@ public class BridgeService extends AccessibilityService {
                 try{JSONObject ack=post("/v1/result",report);if(!ack.optBoolean("ok"))throw new Exception("report_rejected");break;}
                 catch(Exception e){if(attempt>=3)throw e;Thread.sleep(500L*(attempt+1));}
             }
-            failures=0;message="진단 연결됨: "+result.optString("status","unknown");Thread.sleep(800);
+            failures=0;message="서버: "+reply.optString("mode","observe")+" / "+result.optString("status","unknown")+
+                "\n"+reply.optString("message","");Thread.sleep(800);
         }catch(InterruptedException e){break;}
         catch(Exception e){message="연결 재시도: "+e.getClass().getSimpleName();failures=Math.min(failures+1,6);
             try{Thread.sleep(Math.min(15000,500L*(1<<failures)));}catch(InterruptedException stop){break;}}
@@ -121,10 +123,12 @@ public class BridgeService extends AccessibilityService {
                     Path p=new Path();p.moveTo(200,350);p.lineTo(200,1200);
                     builder.addStroke(new GestureDescription.StrokeDescription(p,0,500));
                 }else{
-                    JSONArray points=cmd.getJSONArray("points");if(points.length()<1||points.length()>2)throw new Exception("invalid_points");
+                    JSONArray points=cmd.getJSONArray("points");
+                    if(points.length()<1||points.length()>Math.min(6,GestureDescription.getMaxStrokeCount()))throw new Exception("invalid_points");
                     for(int i=0;i<points.length();i++){
                         JSONObject point=points.getJSONObject(i);int x=point.getInt("x"),y=point.getInt("y");
                         if(x<=249||x>=840||y<=320||y>=1944)throw new Exception("invalid_coordinates");
+                        for(int j=0;j<i;j++)if(Math.abs(y-points.getJSONObject(j).getInt("y"))<100)throw new Exception("overlapping_points");
                         Path p=new Path();p.moveTo(x,y);builder.addStroke(new GestureDescription.StrokeDescription(p,0,120));
                     }
                 }
@@ -144,6 +148,7 @@ public class BridgeService extends AccessibilityService {
         if(!kind.equals("read")){
             JSONObject entry=new JSONObject().put("hash",commandHash).put("result",outcome);
             if(!prefs.edit().putString("command."+id,entry.toString()).commit())return result("uncertain");
+            pruneJournal(id);
         }
         return outcome;
     }
