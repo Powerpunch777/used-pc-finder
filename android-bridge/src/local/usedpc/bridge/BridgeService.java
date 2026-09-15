@@ -145,8 +145,9 @@ public class BridgeService extends AccessibilityService {
                 if(!PreflightTiming.canStart(frame.getLong("read_at"),frame.getLong("read_finished_at"),started,expires)){
                     output[0]=renewed?deferred(started>expires?"deadline_elapsed":"screen_slow"):result("stopped");return;
                 }
-                dispatchEvidence.set(new JSONObject().put("started",started));
-                if(proof!=null)dispatchEvidence.get().put("preflight",proof);
+                JSONObject evidence=new JSONObject().put("started",started);
+                if(proof!=null)evidence.put("preflight",proof);
+                dispatchEvidence.set(evidence);
                 if(kind.equals("back")){
                     boolean accepted=performGlobalAction(GLOBAL_ACTION_BACK);
                     output[0]=withEvidence(result(accepted?"returned":"cancelled").put("returned",System.currentTimeMillis()),dispatchEvidence.get());return;
