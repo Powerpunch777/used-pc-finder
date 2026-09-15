@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.usedpc.bridge" android:versionCode="2" android:versionName="0.2-six-tap">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.usedpc.bridge" android:versionCode="3" android:versionName="0.3-native-preflight">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
     <uses-permission android:name="android.permission.INTERNET" />
     <application android:label="번장 제어 브리지" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:allowBackup="false" android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml/network_security">

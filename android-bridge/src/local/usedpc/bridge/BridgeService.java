@@ -62,7 +62,8 @@ public class BridgeService extends AccessibilityService {
         int failures=0;
         while(active(run))try{
             JSONObject request=new JSONObject().put("version",1).put("device","note9")
-                .put("app_version",2).put("max_tap_points",Math.min(6,GestureDescription.getMaxStrokeCount()));
+                .put("app_version",3).put("preflight_protocol",1)
+                .put("max_tap_points",Math.min(6,GestureDescription.getMaxStrokeCount()));
             JSONObject reply=post("/v1/poll",request);
             if(!active(run))break;
             if(reply.optBoolean("pairing")){message="서버 승인 대기 — 코드 "+pairCode;Thread.sleep(2000);continue;}
@@ -78,7 +79,8 @@ public class BridgeService extends AccessibilityService {
                 catch(Exception e){if(attempt>=3)throw e;Thread.sleep(500L*(attempt+1));}
             }
             failures=0;message="서버: "+reply.optString("mode","observe")+" / "+result.optString("status","unknown")+
-                "\n"+reply.optString("message","");Thread.sleep(800);
+                "\n"+reply.optString("message","");
+            Thread.sleep(kindReadyRead(cmd,result)?100:800);
         }catch(InterruptedException e){break;}
         catch(Exception e){message="연결 재시도: "+e.getClass().getSimpleName();failures=Math.min(failures+1,6);
             try{Thread.sleep(Math.min(15000,500L*(1<<failures)));}catch(InterruptedException stop){break;}}
@@ -95,34 +97,35 @@ public class BridgeService extends AccessibilityService {
         }
         CountDownLatch latch=new CountDownLatch(1);JSONObject[] output=new JSONObject[1];
         AtomicReference<JSONObject> completed=new AtomicReference<>();
+        AtomicReference<JSONObject> dispatchEvidence=new AtomicReference<>();
         main.post(()->{
             try{
                 if(completed.get()!=null)return;
                 if(!active(run)){output[0]=result("stopped");return;}
                 long expires=cmd.optLong("expires",0),now=System.currentTimeMillis();
-                if(expires<now||expires>now+15000){output[0]=result("expired");return;}
+                boolean renewed=!kind.equals("read")&&cmd.optInt("preflight_protocol",0)==1;
+                if(expires<now||expires>now+15000){output[0]=renewed?deferred("deadline_elapsed"):result("expired");return;}
                 JSONObject frame=readScreen();
                 if(completed.get()!=null||!active(run)){output[0]=result("stopped");return;}
                 if(kind.equals("read")){output[0]=frame;return;}
                 // No arbitrary intent, shell, Javascript, text input or app switching.
                 if(!kind.equals("tap")&&!kind.equals("refresh")&&!kind.equals("back")){output[0]=result("unsupported");return;}
-                if(!frame.optString("status").equals("ready")||!frame.optString("hash").equals(cmd.optString("screen_hash"))||
-                    lastRead<=0||System.currentTimeMillis()-lastRead>6000){output[0]=result("screen_changed");return;}
-                // Persist reservation BEFORE dispatch. Process death never retries it.
-                JSONObject entry=new JSONObject().put("hash",commandHash);
-                if(!prefs.edit().putString("command."+id,entry.toString()).commit()){output[0]=result("journal_failed");return;}
-                pruneJournal(id);
-                long started=System.currentTimeMillis();
-                if(completed.get()!=null||!active(run)||started>expires){output[0]=result("stopped");return;}
-                if(kind.equals("back")){
-                    boolean accepted=performGlobalAction(GLOBAL_ACTION_BACK);
-                    output[0]=result(accepted?"returned":"cancelled").put("started",started).put("returned",System.currentTimeMillis());return;
+                String frameStatus=frame.optString("status");
+                if(!frameStatus.equals("ready")){
+                    String reason=frameStatus.equals("locked")?"device_locked":frameStatus.equals("other_app")?"other_app":
+                        frameStatus.equals("read_slow")?"screen_slow":"empty";
+                    output[0]=renewed?deferred(reason):result("screen_changed");return;
                 }
+                if(!frame.optString("hash").equals(cmd.optString("screen_hash"))){
+                    output[0]=renewed?deferred("frame_changed"):result("screen_changed");return;
+                }
+                final JSONObject proof=renewed?new JSONObject().put("version",1).put("read_at",frame.getLong("read_at"))
+                    .put("read_finished_at",frame.getLong("read_finished_at")).put("hash",frame.getString("hash")):null;
                 GestureDescription.Builder builder=new GestureDescription.Builder();
                 if(kind.equals("refresh")){
                     Path p=new Path();p.moveTo(200,350);p.lineTo(200,1200);
                     builder.addStroke(new GestureDescription.StrokeDescription(p,0,500));
-                }else{
+                }else if(kind.equals("tap")){
                     JSONArray points=cmd.getJSONArray("points");
                     if(points.length()<1||points.length()>Math.min(6,GestureDescription.getMaxStrokeCount()))throw new Exception("invalid_points");
                     for(int i=0;i<points.length();i++){
@@ -132,18 +135,34 @@ public class BridgeService extends AccessibilityService {
                         Path p=new Path();p.moveTo(x,y);builder.addStroke(new GestureDescription.StrokeDescription(p,0,120));
                     }
                 }
-                boolean accepted=dispatchGesture(builder.build(),new GestureResultCallback(){
-                    private void finish(String status){try{completed.compareAndSet(null,result(status).put("started",started).put("returned",System.currentTimeMillis()));}catch(Exception ignored){completed.compareAndSet(null,result("uncertain"));}latch.countDown();}
+                final GestureDescription gesture=kind.equals("back")?null:builder.build();
+                // Persist reservation BEFORE dispatch. Process death never retries it.
+                JSONObject entry=new JSONObject().put("hash",commandHash);
+                if(!prefs.edit().putString("command."+id,entry.toString()).commit()){output[0]=result("journal_failed");return;}
+                pruneJournal(id);
+                long started=System.currentTimeMillis();
+                if(completed.get()!=null||!active(run)){output[0]=result("stopped");return;}
+                if(!PreflightTiming.canStart(frame.getLong("read_at"),frame.getLong("read_finished_at"),started,expires)){
+                    output[0]=renewed?deferred(started>expires?"deadline_elapsed":"screen_slow"):result("stopped");return;
+                }
+                dispatchEvidence.set(new JSONObject().put("started",started));
+                if(proof!=null)dispatchEvidence.get().put("preflight",proof);
+                if(kind.equals("back")){
+                    boolean accepted=performGlobalAction(GLOBAL_ACTION_BACK);
+                    output[0]=withEvidence(result(accepted?"returned":"cancelled").put("returned",System.currentTimeMillis()),dispatchEvidence.get());return;
+                }
+                boolean accepted=dispatchGesture(gesture,new GestureResultCallback(){
+                    private void finish(String status){try{completed.compareAndSet(null,withEvidence(result(status).put("returned",System.currentTimeMillis()),dispatchEvidence.get()));}catch(Exception ignored){completed.compareAndSet(null,result("uncertain"));}latch.countDown();}
                     public void onCompleted(GestureDescription g){finish("returned");}
                     public void onCancelled(GestureDescription g){finish("cancelled");}
                 },main);
                 if(accepted)return;
-                output[0]=result("cancelled");
-            }catch(Exception e){output[0]=result("uncertain");}
+                output[0]=withEvidence(result("cancelled").put("returned",System.currentTimeMillis()),dispatchEvidence.get());
+            }catch(Exception e){output[0]=withEvidence(result("uncertain"),dispatchEvidence.get());}
             finally{if(output[0]!=null){completed.compareAndSet(null,output[0]);latch.countDown();}}
         });
-        if(!latch.await(12,TimeUnit.SECONDS))completed.compareAndSet(null,result("uncertain"));
-        completed.compareAndSet(null,result("uncertain"));
+        if(!latch.await(12,TimeUnit.SECONDS))completed.compareAndSet(null,withEvidence(result("uncertain"),dispatchEvidence.get()));
+        completed.compareAndSet(null,withEvidence(result("uncertain"),dispatchEvidence.get()));
         JSONObject outcome=completed.get();
         if(!kind.equals("read")){
             JSONObject entry=new JSONObject().put("hash",commandHash).put("result",outcome);
@@ -189,7 +208,8 @@ public class BridgeService extends AccessibilityService {
         while(!queue.isEmpty())queue.removeFirst().recycle();
         if(System.currentTimeMillis()-readStarted>6000)return result("read_slow");
         lastRead=readStarted;lastHash=sha(screen.toString());
-        return result("ready").put("screen",screen).put("hash",lastHash).put("read_at",lastRead);
+        return result("ready").put("screen",screen).put("hash",lastHash).put("read_at",lastRead)
+            .put("read_finished_at",System.currentTimeMillis());
     }
     private JSONObject post(String path,JSONObject body)throws Exception{
         HttpURLConnection c=(HttpURLConnection)new URL("http://127.0.0.1:8792"+path).openConnection();
@@ -206,6 +226,12 @@ public class BridgeService extends AccessibilityService {
         }finally{c.disconnect();}
     }
     private static JSONObject result(String value){JSONObject o=new JSONObject();try{o.put("status",value);}catch(Exception ignored){}return o;}
+    private static JSONObject deferred(String reason){JSONObject o=result("deferred");try{o.put("reason",reason);}catch(Exception ignored){}return o;}
+    private static boolean kindReadyRead(JSONObject command,JSONObject outcome){return command.optString("type").equals("read")&&outcome.optString("status").equals("ready");}
+    private static JSONObject withEvidence(JSONObject out,JSONObject evidence){
+        try{if(evidence!=null){out.put("started",evidence.getLong("started"));if(evidence.has("preflight"))out.put("preflight",evidence.getJSONObject("preflight"));}}
+        catch(Exception ignored){}return out;
+    }
     private static String sha(String s){try{return hex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));}catch(Exception e){throw new IllegalStateException(e);}}
     private static String hex(byte[] bytes){StringBuilder s=new StringBuilder();for(byte b:bytes)s.append(String.format("%02x",b&255));return s.toString();}
 }

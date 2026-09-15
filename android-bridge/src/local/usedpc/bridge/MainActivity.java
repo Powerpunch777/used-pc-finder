@@ -15,7 +15,7 @@ public class MainActivity extends Activity {
     private TextView status;
     private final Runnable update=new Runnable(){public void run(){
         BridgeService s=BridgeService.instance;
-        status.setText("번장 제어 브리지 0.2 — 최대 6개 동시 터치\n\n"+
+        status.setText("번장 제어 브리지 0.3 — 터치 직전 화면 검증\n\n"+
             (s==null?"접근성 권한을 먼저 켜 주세요.":s.status())+
             "\n\n실행 후 번장 관심 → 즐겨찾기로 이동하세요.\n로컬 서버가 승인한 새로고침·클릭·뒤로가기만 실행합니다.\n빨간점은 키워드 저장 확인 후 처리합니다.\n\n페어링 코드는 최초 연결할 때만 알려주세요.\n중지하려면 이 앱으로 돌아와 중지를 누르세요.");
         handler.postDelayed(this,1000);
