@@ -1,6 +1,8 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.usedpc.bridge" android:versionCode="3" android:versionName="0.3-native-preflight">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.usedpc.bridge" android:versionCode="4" android:versionName="0.4-native-notifications">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <application android:label="번장 제어 브리지" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:allowBackup="false" android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml/network_security">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
@@ -8,6 +10,13 @@
         <service android:name=".BridgeService" android:exported="true" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
             <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility" />
+        </service>
+        <service android:name=".BunjangNotificationListener" android:label="번장 알림 감지" android:exported="true" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+        </service>
+        <receiver android:name=".StopReceiver" android:exported="false" />
+        <service android:name=".BridgeTileService" android:label="번장 실행/중지" android:icon="@android:drawable/ic_media_play" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
         </service>
     </application>
 </manifest>

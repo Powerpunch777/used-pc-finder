@@ -3,6 +3,11 @@ package local.usedpc.bridge;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.app.KeyguardManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Path;
 import android.graphics.Rect;
@@ -24,6 +29,7 @@ import java.util.ArrayDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Semaphore;
 
 public class BridgeService extends AccessibilityService {
     public static volatile BridgeService instance;
@@ -32,6 +38,29 @@ public class BridgeService extends AccessibilityService {
     private volatile long epoch=0;
     private final Handler main=new Handler(Looper.getMainLooper());
     private Thread worker;
+    private Thread wakeWorker;
+    private final Semaphore wakeSignal=new Semaphore(0);
+    private volatile String wakeMessage="알림 신호 대기";
+    private PowerManager.WakeLock screenHold;
+    private final Runnable keepAwake=new Runnable(){public void run(){
+        if(!running){releaseScreenHold();return;}
+        AccessibilityNodeInfo root=null;
+        try{
+            PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
+            KeyguardManager km=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);
+            root=getRootInActiveWindow();
+            boolean keep=prefs.getBoolean("keep_screen",true)&&pm.isInteractive()&&!km.isKeyguardLocked()
+                &&root!=null&&"kr.co.quicket".contentEquals(root.getPackageName()==null?"":root.getPackageName());
+            if(keep){
+                // Note9 service controls another app: Activity KEEP_SCREEN_ON
+                // cannot cover it. Do not wake/unlock a user-switched-off screen.
+                if(screenHold==null){screenHold=pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK,"usedpc:visible-bunjang");screenHold.setReferenceCounted(false);}
+                screenHold.acquire(30000);
+            }else releaseScreenHold();
+        }catch(RuntimeException e){releaseScreenHold();}
+        finally{if(root!=null)root.recycle();}
+        if(running)main.postDelayed(this,5000);
+    }};
     private String token;
     private SharedPreferences prefs;
     private String lastHash="";
@@ -47,13 +76,47 @@ public class BridgeService extends AccessibilityService {
         pairCode=sha(token).substring(0,8).toUpperCase();
         message="중지됨 — 실행은 직접 시작하세요.";
     }
-    public String status(){return "접근성 연결됨\n페어링 코드: "+pairCode+"\n"+message;}
+    public String status(){return "접근성 연결됨\n페어링 코드: "+pairCode+"\n"+message+
+        "\n알림 접근: "+(BunjangNotificationListener.connected?"연결됨":"설정 필요")+
+        "\n"+wakeMessage+" / 미전송 신호 "+NativeWakeQueue.pending(this)+
+        "\n"+BunjangNotificationListener.error;}
+    public boolean isRunning(){return running;}
+    public void wakeChanged(){wakeSignal.release();}
     public synchronized void startDiagnostics(){
-        if(running||worker!=null&&worker.isAlive())return;
+        if(running||worker!=null&&worker.isAlive()||wakeWorker!=null&&wakeWorker.isAlive())return;
+        try{showRunningNotification();NativeWakeQueue.signal(this);}
+        catch(RuntimeException e){message="시작 준비 실패: "+e.getClass().getSimpleName();stopForeground(true);return;}
         running=true;long run=++epoch;message="로컬 서버 연결 중";
+        main.removeCallbacks(keepAwake);main.post(keepAwake);
+        wakeWorker=new Thread(()->wakeLoop(run),"BunjangNativeWake");wakeWorker.start();
         worker=new Thread(()->loop(run),"BunjangBridge");worker.start();
     }
-    public synchronized void stopDiagnostics(){running=false;epoch++;message="사용자가 중지함";if(worker!=null)worker.interrupt();}
+    public synchronized void stopDiagnostics(){running=false;epoch++;message="사용자가 중지함";
+        if(worker!=null)worker.interrupt();if(wakeWorker!=null)wakeWorker.interrupt();
+        main.removeCallbacks(keepAwake);releaseScreenHold();stopForeground(true);}
+    private void releaseScreenHold(){if(screenHold!=null&&screenHold.isHeld())screenHold.release();}
+    private void showRunningNotification(){
+        NotificationManager nm=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);
+        nm.createNotificationChannel(new NotificationChannel("bridge_running","번장 자동 처리",NotificationManager.IMPORTANCE_LOW));
+        PendingIntent open=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent stop=PendingIntent.getBroadcast(this,1,new Intent(this,StopReceiver.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        startForeground(104,new Notification.Builder(this,"bridge_running").setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("번장 자동 처리 실행 중").setContentText("알림 감지 · 서버 연결 · 즐겨찾기 확인")
+            .setContentIntent(open).setOngoing(true).addAction(android.R.drawable.ic_media_pause,"중지",stop).build());
+    }
+    private void wakeLoop(long run){
+        int failures=0;
+        while(active(run))try{
+            wakeSignal.drainPermits();long next=NativeWakeQueue.next(this);
+            if(next==0){wakeSignal.tryAcquire(30,TimeUnit.SECONDS);continue;}
+            JSONObject reply=post("/v1/wake",new JSONObject().put("version",1)
+                .put("package","kr.co.quicket").put("event_id",NativeWakeQueue.id(this,next)));
+            if(!reply.optBoolean("ok")||!reply.optBoolean("stored"))throw new Exception("wake_not_stored");
+            NativeWakeQueue.acknowledge(this,next);failures=0;wakeMessage="알림 신호 서버 저장 완료";
+        }catch(InterruptedException e){break;}
+        catch(Exception e){failures=Math.min(5,failures+1);wakeMessage="알림 재전송 대기: "+e.getClass().getSimpleName();
+            try{Thread.sleep(Math.min(30000,1000L*(1<<failures)));}catch(InterruptedException stop){break;}}
+    }
     public void onInterrupt(){stopDiagnostics();}
     public void onDestroy(){stopDiagnostics();instance=null;super.onDestroy();}
     public void onAccessibilityEvent(AccessibilityEvent event){} // Never collect notification text.
@@ -62,7 +125,7 @@ public class BridgeService extends AccessibilityService {
         int failures=0;
         while(active(run))try{
             JSONObject request=new JSONObject().put("version",1).put("device","note9")
-                .put("app_version",3).put("preflight_protocol",1)
+                .put("app_version",4).put("preflight_protocol",1)
                 .put("max_tap_points",Math.min(6,GestureDescription.getMaxStrokeCount()));
             JSONObject reply=post("/v1/poll",request);
             if(!active(run))break;
@@ -219,7 +282,8 @@ public class BridgeService extends AccessibilityService {
             c.setRequestProperty("Content-Type","application/json");c.setRequestProperty("Authorization","Bearer "+token);c.setDoOutput(true);
             byte[] bytes=body.toString().getBytes(StandardCharsets.UTF_8);c.setFixedLengthStreamingMode(bytes.length);
             try(java.io.OutputStream out=c.getOutputStream()){out.write(bytes);}
-            if(c.getResponseCode()!=200)throw new Exception("http_"+c.getResponseCode());
+            int httpStatus=c.getResponseCode();
+            if(httpStatus!=200&&!(path.equals("/v1/wake")&&httpStatus==202))throw new Exception("http_"+httpStatus);
             try(InputStream in=c.getInputStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){
                 byte[] buf=new byte[4096];int count;while((count=in.read(buf))!=-1){if(out.size()+count>262144)throw new Exception("reply_too_large");out.write(buf,0,count);}
                 return new JSONObject(new String(out.toByteArray(),StandardCharsets.UTF_8));
