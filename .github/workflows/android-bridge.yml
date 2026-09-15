@@ -59,7 +59,7 @@ jobs:
       - name: Keep APK and verification metadata
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bunjang-bridge-0.4-unsigned
+          name: bunjang-bridge-0.5-unsigned
           path: android-bridge/artifacts/
           if-no-files-found: error
           retention-days: 7

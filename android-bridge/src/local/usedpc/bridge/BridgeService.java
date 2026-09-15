@@ -42,6 +42,10 @@ public class BridgeService extends AccessibilityService {
     private final Semaphore wakeSignal=new Semaphore(0);
     private volatile String wakeMessage="알림 신호 대기";
     private PowerManager.WakeLock screenHold;
+    private final ScreenHoldPolicy screenPolicy=new ScreenHoldPolicy();
+    private volatile String screenHoldReason="stopped";
+    private volatile boolean screenHeld=false;
+    private volatile long screenChecked=0;
     private final Runnable keepAwake=new Runnable(){public void run(){
         if(!running){releaseScreenHold();return;}
         AccessibilityNodeInfo root=null;
@@ -49,16 +53,18 @@ public class BridgeService extends AccessibilityService {
             PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
             KeyguardManager km=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);
             root=getRootInActiveWindow();
-            boolean keep=prefs.getBoolean("keep_screen",true)&&pm.isInteractive()&&!km.isKeyguardLocked()
-                &&root!=null&&"kr.co.quicket".contentEquals(root.getPackageName()==null?"":root.getPackageName());
+            String top=root==null||root.getPackageName()==null?null:root.getPackageName().toString();
+            boolean keep=screenPolicy.evaluate(running,prefs.getBoolean("keep_screen",true),pm.isInteractive(),km.isKeyguardLocked(),top);
+            screenHoldReason=screenPolicy.reason;
             if(keep){
                 // Note9 service controls another app: Activity KEEP_SCREEN_ON
                 // cannot cover it. Do not wake/unlock a user-switched-off screen.
-                if(screenHold==null){screenHold=pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK,"usedpc:visible-bunjang");screenHold.setReferenceCounted(false);}
-                screenHold.acquire(30000);
+                if(screenHold==null){screenHold=pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK,"usedpc:visible-bunjang");screenHold.setReferenceCounted(false);}
+                screenHold.acquire(60000);
+                screenHeld=screenHold.isHeld();
             }else releaseScreenHold();
-        }catch(RuntimeException e){releaseScreenHold();}
-        finally{if(root!=null)root.recycle();}
+        }catch(RuntimeException e){releaseScreenHold();screenHoldReason="power_error";}
+        finally{screenChecked=System.currentTimeMillis();if(root!=null)root.recycle();}
         if(running)main.postDelayed(this,5000);
     }};
     private String token;
@@ -79,6 +85,7 @@ public class BridgeService extends AccessibilityService {
     public String status(){return "접근성 연결됨\n페어링 코드: "+pairCode+"\n"+message+
         "\n알림 접근: "+(BunjangNotificationListener.connected?"연결됨":"설정 필요")+
         "\n"+wakeMessage+" / 미전송 신호 "+NativeWakeQueue.pending(this)+
+        "\n화면 유지: "+(screenHeld?"켜짐":"해제")+" ("+screenHoldReason+")"+
         "\n"+BunjangNotificationListener.error;}
     public boolean isRunning(){return running;}
     public void wakeChanged(){wakeSignal.release();}
@@ -93,8 +100,9 @@ public class BridgeService extends AccessibilityService {
     }
     public synchronized void stopDiagnostics(){running=false;epoch++;message="사용자가 중지함";
         if(worker!=null)worker.interrupt();if(wakeWorker!=null)wakeWorker.interrupt();
-        main.removeCallbacks(keepAwake);releaseScreenHold();stopForeground(true);}
-    private void releaseScreenHold(){if(screenHold!=null&&screenHold.isHeld())screenHold.release();}
+        main.removeCallbacks(keepAwake);screenPolicy.evaluate(false,false,false,false,null);screenHoldReason="stopped";
+        releaseScreenHold();stopForeground(true);}
+    private void releaseScreenHold(){if(screenHold!=null&&screenHold.isHeld())screenHold.release();screenHeld=false;}
     private void showRunningNotification(){
         NotificationManager nm=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);
         nm.createNotificationChannel(new NotificationChannel("bridge_running","번장 자동 처리",NotificationManager.IMPORTANCE_LOW));
@@ -125,7 +133,9 @@ public class BridgeService extends AccessibilityService {
         int failures=0;
         while(active(run))try{
             JSONObject request=new JSONObject().put("version",1).put("device","note9")
-                .put("app_version",4).put("preflight_protocol",1)
+                .put("app_version",5).put("preflight_protocol",1)
+                .put("screen_power",new JSONObject().put("enabled",prefs.getBoolean("keep_screen",true))
+                    .put("held",screenHeld).put("reason",screenHoldReason).put("checked_at",screenChecked))
                 .put("max_tap_points",Math.min(6,GestureDescription.getMaxStrokeCount()));
             JSONObject reply=post("/v1/poll",request);
             if(!active(run))break;
